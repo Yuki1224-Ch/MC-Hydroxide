@@ -141,6 +141,18 @@ local function addElement(upvalueLog, upvalue, index, value, temporary)
     return elementLog
 end
 
+local function setTextSafely(label, newText)
+    -- Clear text first to force refresh, then set new value
+    if label and label.Parent then
+        label.Text = ""
+        task.defer(function()
+            if label and label.Parent then
+                label.Text = newText
+            end
+        end)
+    end
+end
+
 local function updateElement(upvalueLog, index, value)
     local indexText = toString(index)
     local elementIndexType = type(index)
@@ -152,18 +164,13 @@ local function updateElement(upvalueLog, index, value)
         return
     end
 
-    -- Only update if values actually changed to prevent unnecessary UI refreshes
-    local currentValueText = elementLog.Value.Label.Text
+    -- Force complete refresh with safe text setting to prevent stuck state
     local newValueText = toString(value)
+    setTextSafely(elementLog.Value.Label, newValueText)
+    elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
+    elementLog.Value.Icon.Image = oh.Constants.Types[elementValueType]
     
-    if currentValueText ~= newValueText then
-        elementLog.Value.Label.Text = newValueText
-        elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
-        elementLog.Value.Icon.Image = oh.Constants.Types[elementValueType]
-    end
-    
-    -- Ensure consistent state
-    elementLog.Index.Label.Text = indexText
+    setTextSafely(elementLog.Index.Label, indexText)
     elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
     elementLog.Index.Icon.Image = oh.Constants.Types[elementIndexType]
 end
@@ -256,13 +263,11 @@ local function updateUpvalue(closureLog, upvalue)
     local newValue = getUpvalue(closure, index)
     local valueType = type(newValue)
 
+    -- Safe text update with clearing to prevent stuck text
     if valueType == "function" then
         local closureName = getInfo(newValue).name or ''
         local newValueText = (closureName == '' and "Unnamed function") or closureName
-        -- Only update if changed to prevent flickering
-        if upvalueLog.Value.Text ~= newValueText then
-            upvalueLog.Value.Text = newValueText
-        end
+        setTextSafely(upvalueLog.Value, newValueText)
     elseif valueType == "table" and upvalue.Scanned then
         for i, v in pairs(upvalue.Scanned) do
             updateElement(upvalueLog, i, v)
@@ -277,10 +282,7 @@ local function updateUpvalue(closureLog, upvalue)
         end
     else
         local newValueText = toString(newValue)
-        -- Only update if changed to prevent flickering
-        if upvalueLog.Value.Text ~= newValueText then
-            upvalueLog.Value.Text = newValueText
-        end
+        setTextSafely(upvalueLog.Value, newValueText)
     end
 
     upvalueLog.Value.TextColor3 = oh.Constants.Syntax[valueType]
@@ -320,8 +322,6 @@ function Log.new(closure)
     
     currentUpvalues[closure.Data] = log
 
-    -- Don't recalculate on every Log.new call during batch operations
-    -- Recalculate will be called once after all logs are added
     return log
 end
 
@@ -329,6 +329,12 @@ function Log.update(log)
     -- Skip update if closure is no longer valid
     if not log.Closure or not log.Instance or not log.Instance.Parent then
         return
+    end
+    
+    -- Update closure name with safe text setting to prevent stuck text
+    local nameLabel = log.Instance:FindFirstChild("Name")
+    if nameLabel then
+        setTextSafely(nameLabel, log.Closure.Name or "")
     end
     
     for _i, upvalue in pairs(log.Closure.Upvalues) do
@@ -367,13 +373,8 @@ local function addUpvalues()
         scanDebounce = true
         lastSearchTime = currentTime
         
-        local unnamedFunctions = {}
         local showResultLabel = false
         local totalResults = 0
-        local maxInitialResults = 50 -- Limit initial results to prevent lag
-
-        upvalueList:Clear()
-        currentUpvalues = {}
 
         -- Use debounce to prevent lag during search
         local scanResults = Methods.Scan(query, deepSearchFlag)
@@ -386,51 +387,51 @@ local function addUpvalues()
         
         local resultCount = #resultsArray
         
+        -- Create a set of new result closures for fast lookup
+        local newResultClosures = {}
+        for i = 1, resultCount do
+            newResultClosures[resultsArray[i].Data] = true
+        end
+        
+        -- Hide all existing logs first (visibility filtering approach)
+        local hiddenLogs = {}
+        for closureData, log in pairs(currentUpvalues) do
+            if log.Instance and log.Instance.Parent then
+                log.Instance.Visible = false
+                table.insert(hiddenLogs, closureData)
+            end
+        end
+        
         -- Process results in batches to prevent freezing
         local processed = 0
-        local batchSize = 20
+        local batchSize = 30 -- Increased batch size for faster display
         
         while processed < resultCount do
             local batchEnd = math.min(processed + batchSize, resultCount)
             
             for i = processed + 1, batchEnd do
                 local closure = resultsArray[i]
-                if closure.Name == '' then
-                    unnamedFunctions[closure.Data] = closure
+                local closureData = closure.Data
+                
+                -- Check if this closure already has a log
+                local existingLog = currentUpvalues[closureData]
+                
+                if existingLog then
+                    -- Reuse existing log - just update values and make visible
+                    existingLog.Instance.Visible = true
+                    existingLog:Update()
+                    totalResults = totalResults + 1
                 else
+                    -- Create new log for this closure
                     Log.new(closure)
+                    totalResults = totalResults + 1
                 end
-                totalResults = totalResults + 1
             end
             
             processed = batchEnd
             
             -- Yield to prevent freezing if more results to process
             if processed < resultCount then
-                task.wait(0.01)
-            end
-        end
-
-        -- Add unnamed functions in batches too
-        local unnamedArray = {}
-        for _i, closure in pairs(unnamedFunctions) do
-            table.insert(unnamedArray, closure)
-        end
-        
-        processed = 0
-        local unnamedCount = #unnamedArray
-        
-        while processed < unnamedCount do
-            local batchEnd = math.min(processed + batchSize, unnamedCount)
-            
-            for i = processed + 1, batchEnd do
-                local closure = unnamedArray[i]
-                Log.new(closure)
-            end
-            
-            processed = batchEnd
-            
-            if processed < unnamedCount then
                 task.wait(0.01)
             end
         end
@@ -787,7 +788,14 @@ changeElementContext:SetCallback(function()
     end
 end)
 
--- Optimized smooth update loop with better performance and scroll fix
+-- Optimized smooth update loop with improved scroll handling and text refresh
+local visibleClosureLogs = {}
+local lastScrollPosition = 0
+local scrollCheckInterval = 0.05
+local lastScrollCheck = 0
+local cacheRefreshInterval = 0.2
+local lastCacheRefresh = 0
+
 oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
     -- Only update if the page is visible
     if not isVisible then
@@ -799,44 +807,87 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
         return
     end
     
-    -- Smooth time-based updates instead of frame-based
     local currentTime = tick()
+    
+    -- Check scroll position periodically to invalidate cache
+    if ResultsClip then
+        local currentScroll = ResultsClip.CanvasPosition.Y
+        
+        -- Detect scroll movement
+        if math.abs(currentScroll - lastScrollPosition) > 1 then
+            lastScrollPosition = currentScroll
+            lastScrollCheck = currentTime
+            -- Clear visible cache when scrolling to force fresh updates
+            visibleClosureLogs = {}
+        end
+        
+        -- Periodic cache refresh even without scroll to prevent stuck text
+        if currentTime - lastCacheRefresh > cacheRefreshInterval then
+            lastCacheRefresh = currentTime
+            visibleClosureLogs = {}
+        end
+    end
+    
+    -- Smooth time-based updates
     if currentTime - lastUpdateTime < updateInterval then
         return
     end
     lastUpdateTime = currentTime
     
+    -- Get current visible range
+    local clip = ResultsClip
+    local viewportTop = 0
+    local viewportBottom = 0
+    
+    if clip then
+        viewportTop = clip.AbsolutePosition.Y
+        viewportBottom = viewportTop + clip.AbsoluteSize.Y
+    end
+    
     -- Batch updates for smoother performance
     local updateCount = 0
-    local maxUpdatesPerFrame = 8 -- Increased for smoother UI but still limited
+    local maxUpdatesPerFrame = 8
     
     for _i, closureLog in pairs(currentUpvalues) do
         if updateCount >= maxUpdatesPerFrame then
             break
         end
         
-        -- Check if the log still exists and is visible in the viewport before updating
+        -- Check if the log still exists and is valid
         if closureLog and closureLog.Instance and closureLog.Instance.Parent then
-            -- Only update if the instance is within or near the visible area
-            -- This prevents updating off-screen elements that cause stuck text
-            local clip = ResultsClip
-            if clip then
-                local absPos = closureLog.Instance.AbsolutePosition.Y
-                local absSize = closureLog.Instance.AbsoluteSize.Y
-                local clipTop = clip.AbsolutePosition.Y
-                local clipBottom = clipTop + clip.AbsoluteSize.Y
-                
-                -- Update if visible or within buffer zone (200px above/below)
-                if absPos + absSize >= clipTop - 200 and absPos <= clipBottom + 200 then
-                    closureLog:Update()
-                    updateCount = updateCount + 1
-                end
-            else
-                -- Fallback: update anyway if clip doesn't exist
+            local instance = closureLog.Instance
+            
+            -- Skip invisible items (search filtered out)
+            if not instance.Visible then
+                visibleClosureLogs[closureLog] = nil
+                goto continue
+            end
+            
+            local absPos = instance.AbsolutePosition.Y
+            local absSize = instance.AbsoluteSize.Y
+            
+            -- Buffer zone for preloading
+            local bufferZone = 250
+            
+            -- Check if within or near visible area
+            local isInView = (absPos + absSize >= viewportTop - bufferZone) and (absPos <= viewportBottom + bufferZone)
+            
+            if isInView then
+                -- Force update visible items to prevent stuck text
                 closureLog:Update()
                 updateCount = updateCount + 1
+                visibleClosureLogs[closureLog] = true
+            elseif visibleClosureLogs[closureLog] then
+                -- Item was visible but now scrolled away - final update then remove from cache
+                closureLog:Update()
+                visibleClosureLogs[closureLog] = nil
             end
+        else
+            -- Clean up invalid entries
+            visibleClosureLogs[closureLog] = nil
         end
+        
+        ::continue::
     end
 end)
 
@@ -872,12 +923,31 @@ local function onPageVisible(visible)
             SearchBox:ReleaseFocus()
         end
         
+        -- Clear visible cache to prevent stuck text on next visit
+        visibleClosureLogs = {}
+        lastScrollPosition = 0
+        
         -- Force UI to refresh and clear any stuck elements with multiple cleanup passes
         task.spawn(function()
             for i = 1, 3 do
                 task.wait(0.02)
                 if SearchBox and SearchBox.Parent then
                     SearchBox:ReleaseFocus()
+                end
+            end
+        end)
+    else
+        -- When becoming visible, force a recalculation to fix any stuck positions
+        task.defer(function()
+            if ResultsClip and upvalueList then
+                upvalueList:Recalculate()
+            end
+        end)
+        -- Force update all visible items immediately
+        task.defer(function()
+            for _, closureLog in pairs(currentUpvalues) do
+                if closureLog and closureLog.Instance and closureLog.Instance.Visible then
+                    closureLog:Update()
                 end
             end
         end)

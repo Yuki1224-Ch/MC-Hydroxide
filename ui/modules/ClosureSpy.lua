@@ -108,9 +108,10 @@ local hookLogsMenu = ContextMenu.new({ callingScriptContext, spyClosureContext, 
 local closureConditionMenu = ContextMenu.new({ removeConditionContext })
 local closureConditionMenuSelected = ContextMenu.new({ removeConditionContextSelected })
 
--- Optimized search with debounce
+-- Optimized search with debounce and queue processing
 local searchDebounce = false
 local searchQueue = {}
+local searchCooldown = 0.1 -- Reduced cooldown for faster response
 
 local function processSearchQueue()
     if searchDebounce or #searchQueue == 0 then return end
@@ -119,15 +120,19 @@ local function processSearchQueue()
     local searchText = table.remove(searchQueue, 1)
     
     task.spawn(function()
+        -- Fast visibility filtering without recreating UI elements
         for hook, log in pairs(currentLogs) do
             if not log.Button.Instance then continue end
             local instance = log.Button.Instance
             if not instance.Parent then continue end
-            instance.Visible = not (instance.Visible and searchText ~= "" and not hook.Closure.Name:lower():find(searchText, 1, true))
+            
+            local shouldShow = searchText == "" or hook.Closure.Name:lower():find(searchText, 1, true) ~= nil
+            instance.Visible = shouldShow
         end
+        
         closureList:Recalculate()
         
-        task.wait(0.05)
+        task.wait(searchCooldown)
         searchDebounce = false
         
         if #searchQueue > 0 then

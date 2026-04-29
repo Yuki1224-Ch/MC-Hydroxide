@@ -1,16 +1,99 @@
 ```
-# Lua bytecode
-*.lua~
+# Lua-specific
+*.luac
+?.lua.1
+?_lua.1
 
-# Backup and swap files
-*.bak
-*.swp
-*.swo
+# Dependencies
+?.deps
+.deps
 
-# Log files
+# Build artifacts
+build/
+dist/
+*.so
+*.dll
+*.dylib
+
+# Logs and temp files
 *.log
-
-# Temporary files
 *.tmp
-*~
+*.swp
+
+# Editors
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Python (if mixed project)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Node (if mixed project)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Java (if mixed project)
+*.class
+*.jar
+*.war
+*.ear
+target/
+.gradle/
+build/
+
+# C/C++ (if mixed project)
+*.o
+*.a
+*.obj
+*.out
+*.exe
+*.dll
+*.so
+
+# Compression
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
+
+# System
+.DS_Store
+Thumbs.db
 ```

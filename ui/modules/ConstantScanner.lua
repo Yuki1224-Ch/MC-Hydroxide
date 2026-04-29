@@ -105,10 +105,12 @@ function Log.new(closure)
     return log
 end
 
--- UI Functinoality
+-- UI Functionality
 
+-- Optimized search with debounce and fast filtering
 local searchDebounce = false
 local searchQueue = {}
+local searchCooldown = 0.1 -- Reduced cooldown for faster response
 
 local function processSearchQueue()
     if searchDebounce or #searchQueue == 0 then return end
@@ -126,19 +128,32 @@ local function processSearchQueue()
                 return
             end
 
-            constantList:Clear()
-            constantLogs = {}
-
-            for _i, closure in pairs(Methods.Scan(query)) do
-                Log.new(closure)
+            -- Fast visibility filtering instead of clearing and recreating
+            local resultCount = 0
+            for closureData, log in pairs(constantLogs) do
+                if not log.Button.Instance then continue end
+                local instance = log.Button.Instance
+                if not instance.Parent then continue end
+                
+                local closureName = ""
+                pcall(function()
+                    closureName = (getInfo(closureData).name or ""):lower()
+                end)
+                
+                local shouldShow = closureName:find(query, 1, true) ~= nil
+                instance.Visible = shouldShow
+                
+                if shouldShow then
+                    resultCount = resultCount + 1
+                end
             end
-
+            
             constantList:Recalculate()
         else
             MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
         end
         
-        task.wait(0.05)
+        task.wait(searchCooldown)
         searchDebounce = false
         
         if #searchQueue > 0 then
@@ -158,8 +173,25 @@ local function addConstants()
         constantList:Clear()
         constantLogs = {}
 
-        for _i, closure in pairs(Methods.Scan(query)) do
-            Log.new(closure)
+        -- Batch processing to prevent freezing
+        local scanResults = Methods.Scan(query)
+        local resultsArray = {}
+        for _i, closure in pairs(scanResults) do
+            table.insert(resultsArray, closure)
+        end
+        
+        local batchSize = 50
+        local totalResults = #resultsArray
+        
+        for i = 1, totalResults, batchSize do
+            local endIndex = math.min(i + batchSize - 1, totalResults)
+            for j = i, endIndex do
+                Log.new(resultsArray[j])
+            end
+            
+            if i + batchSize <= totalResults then
+                task.wait(0.01)
+            end
         end
 
         constantList:Recalculate()
