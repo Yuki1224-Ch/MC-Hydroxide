@@ -1,5 +1,6 @@
 local TextService = game:GetService("TextService")
 local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 
 local RemoteSpy = {}
 local Methods = import("modules/RemoteSpy")
@@ -121,6 +122,34 @@ local remoteListMenuSelected = ContextMenu.new({ pathContextSelected, clearConte
 local remoteLogsMenu = ContextMenu.new({ scriptContext, callingScriptContext, spyClosureContext, repeatCallContext, viewAsHexContext })
 local remoteConditionMenu = ContextMenu.new({ removeConditionContext })
 local remoteConditionMenuSelected = ContextMenu.new({ removeConditionContextSelected })
+
+-- Optimized search with debounce
+local searchDebounce = false
+local searchQueue = {}
+
+local function processSearchQueue()
+    if searchDebounce or #searchQueue == 0 then return end
+    
+    searchDebounce = true
+    local searchText = table.remove(searchQueue, 1)
+    
+    task.spawn(function()
+        for remoteInstance, log in pairs(currentLogs) do
+            if not log.Button.Instance then continue end
+            local instance = log.Button.Instance
+            if not instance.Parent then continue end
+            instance.Visible = not (instance.Visible and searchText ~= "" and not remoteInstance.Name:lower():find(searchText, 1, true))
+        end
+        remoteList:Recalculate()
+        
+        task.wait(0.05)
+        searchDebounce = false
+        
+        if #searchQueue > 0 then
+            processSearchQueue()
+        end
+    end)
+end
 
 local function checkCurrentIgnored()
     local selectedRemote = (selected.remoteLog or selected.logContext).Remote
@@ -511,13 +540,9 @@ for _i,flag in pairs(ListFlags:GetChildren()) do
 end
 
 ListSearch.FocusLost:Connect(function(returned)
-    if returned then
-        for remoteInstance, log in pairs(currentLogs) do
-            local instance = log.Button.Instance
-            instance.Visible = not (instance.Visible and not remoteInstance.Name:lower():find(ListSearch.Text))
-        end
-
-        remoteList:Recalculate()
+    if returned and ListSearch.Text ~= "" then
+        table.insert(searchQueue, ListSearch.Text:lower())
+        processSearchQueue()
         ListSearch.Text = ""
     end
 end)

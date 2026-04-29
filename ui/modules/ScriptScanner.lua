@@ -185,6 +185,27 @@ end
 
 -- UI Functionality
 
+local searchDebounce = false
+local searchQueue = {}
+
+local function processSearchQueue()
+    if searchDebounce or #searchQueue == 0 then return end
+    
+    searchDebounce = true
+    local searchText = table.remove(searchQueue, 1)
+    
+    task.spawn(function()
+        addScripts(searchText)
+        
+        task.wait(0.05)
+        searchDebounce = false
+        
+        if #searchQueue > 0 then
+            processSearchQueue()
+        end
+    end)
+end
+
 local function addScripts(query)
     scriptList:Clear()
     scriptLogs = {}
@@ -197,8 +218,9 @@ local function addScripts(query)
 end
 
 ListSearch.FocusLost:Connect(function(returned)
-    if returned then
-        addScripts(ListSearch.Text)
+    if returned and ListSearch.Text ~= "" then
+        table.insert(searchQueue, ListSearch.Text)
+        processSearchQueue()
         ListSearch.Text = ""
     end
 end)

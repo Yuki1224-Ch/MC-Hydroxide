@@ -106,6 +106,47 @@ function Log.new(closure)
 end
 
 -- UI Functinoality
+
+local searchDebounce = false
+local searchQueue = {}
+
+local function processSearchQueue()
+    if searchDebounce or #searchQueue == 0 then return end
+    
+    searchDebounce = true
+    local searchText = table.remove(searchQueue, 1)
+    
+    task.spawn(function()
+        local query = searchText
+        
+        if query:gsub(' ', '') ~= '' then
+            if not tonumber(query) and query:len() <= 1 then
+                searchDebounce = false
+                if #searchQueue > 0 then processSearchQueue() end
+                return
+            end
+
+            constantList:Clear()
+            constantLogs = {}
+
+            for _i, closure in pairs(Methods.Scan(query)) do
+                Log.new(closure)
+            end
+
+            constantList:Recalculate()
+        else
+            MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
+        end
+        
+        task.wait(0.05)
+        searchDebounce = false
+        
+        if #searchQueue > 0 then
+            processSearchQueue()
+        end
+    end)
+end
+
 local function addConstants()
     local query = SearchBox.Text
 
@@ -200,8 +241,10 @@ end)
 
 Search.MouseButton1Click:Connect(addConstants)
 SearchBox.FocusLost:Connect(function(returned)
-    if returned then
-        addConstants()
+    if returned and SearchBox.Text ~= "" then
+        table.insert(searchQueue, SearchBox.Text)
+        processSearchQueue()
+        SearchBox.Text = ""
     end
 end)
 
