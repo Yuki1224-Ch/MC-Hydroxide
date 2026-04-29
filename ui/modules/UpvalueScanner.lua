@@ -1,5 +1,6 @@
 local RunService = game:GetService("RunService")
 local TextService = game:GetService("TextService")
+local TweenService = game:GetService("TweenService")
 
 local UpvalueScanner = {}
 local ClosureSpy = import("modules/ClosureSpy")
@@ -39,11 +40,23 @@ local upvalueList = List.new(ResultsClip.Content)
 
 local deepSearchFlag = false
 local currentUpvalues = {}
+local updateConnection = nil
+local isVisible = false
+local scanDebounce = false
+local pendingSearchQuery = nil
+local lastSearchTime = 0
+local searchCooldown = 0.25 -- Reduced cooldown for snappier search
 
 local selectedLog
 local selectedUpvalue
 local selectedUpvalueLog
 local selectedElement
+
+-- Smooth UI update tracking
+local lastUpdateTime = 0
+local updateInterval = 1/60 -- 60 FPS target
+local pendingUpdates = {}
+local isUpdating = false
 
 local spyClosureContext = ContextMenuButton.new("rbxassetid://4666593447", "Spy Closure")
 local viewUpvaluesContext = ContextMenuButton.new("rbxassetid://5179169654", "View All Upvalues")
@@ -133,6 +146,11 @@ local function updateElement(upvalueLog, index, value)
     local elementIndexType = type(index)
     local elementValueType = type(value)
     local elementLog = upvalueLog.Elements:FindFirstChild(indexText)
+    
+    -- Skip if element UI no longer exists
+    if not elementLog then
+        return
+    end
 
     elementLog.Index.Label.Text = indexText
     elementLog.Value.Label.Text = toString(value)
@@ -220,6 +238,12 @@ end
 
 local function updateUpvalue(closureLog, upvalue)
     local upvalueLog = closureLog.Instance.Upvalues[tostring(upvalue.Index)]
+    
+    -- Skip if upvalue UI no longer exists
+    if not upvalueLog then
+        return
+    end
+    
     local closure = upvalue.Closure
     local index = upvalue.Index
     local newValue = getUpvalue(closure, index)
@@ -281,11 +305,17 @@ function Log.new(closure)
     
     currentUpvalues[closure.Data] = log
 
-    upvalueList:Recalculate()
+    -- Don't recalculate on every Log.new call during batch operations
+    -- Recalculate will be called once after all logs are added
     return log
 end
 
 function Log.update(log)
+    -- Skip update if closure is no longer valid
+    if not log.Closure or not log.Instance or not log.Instance.Parent then
+        return
+    end
+    
     for _i, upvalue in pairs(log.Closure.Upvalues) do
         updateUpvalue(log, upvalue)
     end
@@ -297,19 +327,41 @@ end
 
 local function addUpvalues()
     local query = SearchBox.Text
+    local currentTime = tick()
+    
+    -- Prevent search if already scanning or in cooldown
+    if scanDebounce then
+        pendingSearchQuery = query
+        return
+    end
+    
+    -- Time-based debounce for smoother UI
+    if currentTime - lastSearchTime < searchCooldown then
+        pendingSearchQuery = query
+        return
+    end
 
     if query:gsub(' ', '') ~= '' then
         if not tonumber(query) and query:len() <= 1 then
+            MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
+            SearchBox.Text = ""
             return
         end
 
+        -- Set debounce to prevent lag
+        scanDebounce = true
+        lastSearchTime = currentTime
+        
         local unnamedFunctions = {}
         local showResultLabel = false
 
         upvalueList:Clear()
         currentUpvalues = {}
 
-        for _i, closure in pairs(Methods.Scan(query, deepSearchFlag)) do
+        -- Use debounce to prevent lag during search
+        local scanResults = Methods.Scan(query, deepSearchFlag)
+        
+        for _i, closure in pairs(scanResults) do
             if closure.Name == '' then
                 unnamedFunctions[closure.Data] = closure
             else
@@ -326,6 +378,18 @@ local function addUpvalues()
         ResultStatus.Visible = showResultLabel
 
         upvalueList:Recalculate()
+        
+        -- Reset debounce after a short delay
+        task.delay(searchCooldown, function()
+            scanDebounce = false
+            -- Process pending search if any
+            if pendingSearchQuery and pendingSearchQuery:gsub(' ', '') ~= '' then
+                local tempQuery = pendingSearchQuery
+                pendingSearchQuery = nil
+                SearchBox.Text = tempQuery
+                addUpvalues()
+            end
+        end)
     else
         MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
     end
@@ -342,11 +406,18 @@ deepSearch:SetCallback(function(enabled)
     end
 end)
 
-Search.MouseButton1Click:Connect(addUpvalues)
+-- Optimized search trigger with debounce
+local function triggerSearch()
+    if not scanDebounce then
+        addUpvalues()
+    end
+end
+
+Search.MouseButton1Click:Connect(triggerSearch)
 
 SearchBox.FocusLost:Connect(function(returned)
     if returned then
-        addUpvalues()
+        triggerSearch()
     end
 end)
 
@@ -655,9 +726,118 @@ changeElementContext:SetCallback(function()
     end
 end)
 
-oh.Events.UpdateUpvalues = RunService.Heartbeat:Connect(function()
+-- Optimized smooth update loop with better performance
+oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
+    -- Only update if the page is visible
+    if not isVisible then
+        return
+    end
+    
+    -- Skip update if scanning is in progress to reduce lag
+    if scanDebounce then
+        return
+    end
+    
+    -- Smooth time-based updates instead of frame-based
+    local currentTime = tick()
+    if currentTime - lastUpdateTime < updateInterval then
+        return
+    end
+    lastUpdateTime = currentTime
+    
+    -- Batch updates for smoother performance
+    local updateCount = 0
+    local maxUpdatesPerFrame = 8 -- Increased for smoother UI but still limited
+    
     for _i, closureLog in pairs(currentUpvalues) do
-        closureLog:Update()
+        if updateCount >= maxUpdatesPerFrame then
+            break
+        end
+        
+        -- Check if the log still exists before updating
+        if closureLog and closureLog.Instance and closureLog.Instance.Parent then
+            closureLog:Update()
+            updateCount = updateCount + 1
+        end
+    end
+end)
+
+-- Handle page visibility to prevent stuck text and unnecessary updates
+local Pages = Base.Body.Pages
+local function onPageVisible(visible)
+    isVisible = visible
+
+    if not visible then
+        -- Clear selections when page is hidden to prevent stuck text
+        selectedLog = nil
+        selectedUpvalue = nil
+        selectedUpvalueLog = nil
+        selectedElement = nil
+
+        -- Hide any open prompts immediately
+        modifyUpvalue:Hide()
+        modifyElement:Hide()
+
+        -- Hide context menus immediately
+        closureContextMenu:Hide()
+        tableContextMenu:Hide()
+        upvalueContextMenu:Hide()
+        elementContextMenu:Hide()
+        
+        -- Reset search box and clear pending searches
+        SearchBox.Text = ""
+        pendingSearchQuery = nil
+        scanDebounce = false
+        
+        -- Clear focus from search box to prevent text sticking
+        SearchBox:ReleaseFocus()
+        
+        -- Force UI to refresh and clear any stuck elements
+        task.spawn(function()
+            task.wait(0.05)
+            if SearchBox and SearchBox.Parent then
+                SearchBox:ReleaseFocus()
+            end
+        end)
+    end
+end
+
+-- Connect to tab selector to track visibility with improved switching
+local originalSelectTab = TabSelector.SelectTab
+TabSelector.SelectTab = function(tabName)
+    -- Hide current page before switching to prevent stuck UI
+    if isVisible and tabName ~= "UpvalueScanner" then
+        onPageVisible(false)
+    end
+
+    local result = originalSelectTab(tabName)
+
+    -- Show new page if it's UpvalueScanner
+    if tabName == "UpvalueScanner" and result then
+        task.wait(0.05) -- Reduced delay for snappier response
+        onPageVisible(true)
+    end
+
+    return result
+end
+
+-- Also listen for direct page visibility changes
+if Page:GetPropertyChangedSignal("Visible") then
+    Page:GetPropertyChangedSignal("Visible"):Connect(function()
+        if not Page.Visible and isVisible then
+            onPageVisible(false)
+        elseif Page.Visible and not isVisible then
+            onPageVisible(true)
+        end
+    end)
+end
+
+-- Initial visibility check with faster response
+task.spawn(function()
+    task.wait(0.1)
+    local currentPage = Pages and Pages.UpvalueScanner
+    if currentPage and currentPage.Visible then
+        onPageVisible(true)
     end
 end)
 
