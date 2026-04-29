@@ -141,6 +141,18 @@ local function addElement(upvalueLog, upvalue, index, value, temporary)
     return elementLog
 end
 
+local function setTextSafely(label, newText)
+    -- Clear text first to force refresh, then set new value
+    if label and label.Parent then
+        label.Text = ""
+        task.defer(function()
+            if label and label.Parent then
+                label.Text = newText
+            end
+        end)
+    end
+end
+
 local function updateElement(upvalueLog, index, value)
     local indexText = toString(index)
     local elementIndexType = type(index)
@@ -152,26 +164,15 @@ local function updateElement(upvalueLog, index, value)
         return
     end
 
-    -- Force refresh to prevent stuck text by clearing first
+    -- Force complete refresh with safe text setting to prevent stuck state
     local newValueText = toString(value)
-    elementLog.Value.Label.Text = ""
-    task.defer(function()
-        if elementLog and elementLog.Parent then
-            elementLog.Value.Label.Text = newValueText
-            elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
-            elementLog.Value.Icon.Image = oh.Constants.Types[elementValueType]
-        end
-    end)
+    setTextSafely(elementLog.Value.Label, newValueText)
+    elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
+    elementLog.Value.Icon.Image = oh.Constants.Types[elementValueType]
     
-    -- Ensure consistent state for index
-    elementLog.Index.Label.Text = ""
-    task.defer(function()
-        if elementLog and elementLog.Parent then
-            elementLog.Index.Label.Text = indexText
-            elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
-            elementLog.Index.Icon.Image = oh.Constants.Types[elementIndexType]
-        end
-    end)
+    setTextSafely(elementLog.Index.Label, indexText)
+    elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
+    elementLog.Index.Icon.Image = oh.Constants.Types[elementIndexType]
 end
 
 local function addUpvalue(upvalue, temporary)
@@ -262,18 +263,7 @@ local function updateUpvalue(closureLog, upvalue)
     local newValue = getUpvalue(closure, index)
     local valueType = type(newValue)
 
-    -- Force text refresh by clearing first, then setting new value
-    local function setTextSafely(label, newText)
-        if label and label.Parent then
-            label.Text = ""
-            task.defer(function()
-                if label and label.Parent then
-                    label.Text = newText
-                end
-            end)
-        end
-    end
-
+    -- Safe text update with clearing to prevent stuck text
     if valueType == "function" then
         local closureName = getInfo(newValue).name or ''
         local newValueText = (closureName == '' and "Unnamed function") or closureName
@@ -326,20 +316,12 @@ function Log.new(closure)
     instance.Size = UDim2.new(1, 0, 0, logHeight)
     instance:FindFirstChild("Name").Text = closure.Name
     
-    -- Force text refresh to prevent stuck text
-    local nameLabel = instance:FindFirstChild("Name")
-    if nameLabel then
-        nameLabel.Text = nameLabel.Text -- Force refresh
-    end
-    
     listButton:SetRightCallback(function()
         selectedLog = log
     end)
     
     currentUpvalues[closure.Data] = log
 
-    -- Don't recalculate on every Log.new call during batch operations
-    -- Recalculate will be called once after all logs are added
     return log
 end
 
@@ -349,15 +331,10 @@ function Log.update(log)
         return
     end
     
-    -- Force text refresh at the start of each update to prevent stuck text
+    -- Update closure name with safe text setting to prevent stuck text
     local nameLabel = log.Instance:FindFirstChild("Name")
     if nameLabel then
-        nameLabel.Text = ""
-        task.defer(function()
-            if nameLabel and nameLabel.Parent then
-                nameLabel.Text = log.Closure.Name or nameLabel.Text
-            end
-        end)
+        setTextSafely(nameLabel, log.Closure.Name or "")
     end
     
     for _i, upvalue in pairs(log.Closure.Upvalues) do
@@ -964,6 +941,14 @@ local function onPageVisible(visible)
         task.defer(function()
             if ResultsClip and upvalueList then
                 upvalueList:Recalculate()
+            end
+        end)
+        -- Force update all visible items immediately
+        task.defer(function()
+            for _, closureLog in pairs(currentUpvalues) do
+                if closureLog and closureLog.Instance and closureLog.Instance.Visible then
+                    closureLog:Update()
+                end
             end
         end)
     end
