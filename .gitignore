@@ -1,5 +1,7 @@
-debug.lua
-selene.toml
-roblox.toml
-.vscode
-/user
+```
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.MC-Hydroxide/
+```
