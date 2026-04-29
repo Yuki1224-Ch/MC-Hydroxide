@@ -66,7 +66,7 @@ getgenv().signaluis = UserInput.InputBegan:Connect(function(input,gp)
 	end
 end)
 
-local moduleId = {"RemoteSpy","ClosureSpy","ScriptScanner","ModuleScanner","UpvalueScanner","ConstantScanner"}
+local moduleId = {"RemoteSpy","ClosureSpy","ScriptScanner","ModuleScanner","UpvalueScanner","ConstantScanner","BugFinder"}
 
 function moduleError(err)
 	local message
@@ -87,7 +87,8 @@ xpcall(function()
 	ScriptScanner = import("ui/modules/ScriptScanner");
 	ModuleScanner = import("ui/modules/ModuleScanner");
 	UpvalueScanner = import("ui/modules/UpvalueScanner");
-	ConstantScanner = import("ui/modules/ConstantScanner"); 
+	ConstantScanner = import("ui/modules/ConstantScanner");
+	BugFinder = import("ui/modules/BugFinder"); 
 end, function(err)
 	moduleError(err)
 end)

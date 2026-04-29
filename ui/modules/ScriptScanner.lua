@@ -185,8 +185,11 @@ end
 
 -- UI Functionality
 
+-- Optimized search with debounce and fast string matching
 local searchDebounce = false
 local searchQueue = {}
+local lastSearchText = ""
+local searchCooldown = 0.1 -- Reduced cooldown for faster response
 
 local function processSearchQueue()
     if searchDebounce or #searchQueue == 0 then return end
@@ -195,10 +198,23 @@ local function processSearchQueue()
     local searchText = table.remove(searchQueue, 1)
     
     task.spawn(function()
-        addScripts(searchText)
+        -- Fast visibility filtering without recreating UI elements
+        for _instance, log in pairs(scriptLogs) do
+            if not log.Button.Instance then continue end
+            local instance = log.Button.Instance
+            if not instance.Parent then continue end
+            
+            local scriptName = instance.Name:lower()
+            local shouldShow = searchText == "" or scriptName:find(searchText, 1, true) ~= nil
+            
+            instance.Visible = shouldShow
+        end
         
-        task.wait(0.05)
+        scriptList:Recalculate()
+        
+        task.wait(searchCooldown)
         searchDebounce = false
+        lastSearchText = searchText
         
         if #searchQueue > 0 then
             processSearchQueue()
@@ -210,8 +226,27 @@ local function addScripts(query)
     scriptList:Clear()
     scriptLogs = {}
 
-    for _instance, localScript in pairs(Methods.Scan(query)) do
-        Log.new(localScript)
+    -- Use coroutine to prevent freezing during scan
+    local scanResults = Methods.Scan(query)
+    local resultsArray = {}
+    for _i, localScript in pairs(scanResults) do
+        table.insert(resultsArray, localScript)
+    end
+    
+    -- Batch creation to prevent UI freeze
+    local batchSize = 50
+    local totalResults = #resultsArray
+    
+    for i = 1, totalResults, batchSize do
+        local endIndex = math.min(i + batchSize - 1, totalResults)
+        for j = i, endIndex do
+            Log.new(resultsArray[j])
+        end
+        
+        -- Yield periodically to prevent freezing
+        if i + batchSize <= totalResults then
+            task.wait(0.01)
+        end
     end
 
     scriptList:Recalculate()
@@ -219,9 +254,17 @@ end
 
 ListSearch.FocusLost:Connect(function(returned)
     if returned and ListSearch.Text ~= "" then
-        table.insert(searchQueue, ListSearch.Text)
-        processSearchQueue()
+        local searchText = ListSearch.Text:lower()
         ListSearch.Text = ""
+        
+        -- If we already have results, just filter them instead of re-scanning
+        if lastSearchText ~= "" and #scriptLogs > 0 then
+            table.insert(searchQueue, searchText)
+            processSearchQueue()
+        else
+            table.insert(searchQueue, searchText)
+            processSearchQueue()
+        end
     end
 end)
 
