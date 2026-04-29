@@ -1,58 +1,16 @@
-# Compiled and build artifacts
-*.pyc
-__pycache__/
-*.o
-*.obj
-*.class
-*.dll
-*.so
-*.a
-*.exe
-*.out
+```
+# Lua bytecode
+*.lua~
 
-# Dependencies
-node_modules/
-venv/
-.venv/
-.env
-.env.local
-.env.*
-
-# Logs and temp files
-*.log
-*.tmp
+# Backup and swap files
+*.bak
 *.swp
 *.swo
 
-# Editors
-.vscode/
-.idea/
+# Log files
+*.log
 
-# Build directories
-dist/
-build/
-target/
-.gradle/
-
-# Python specific
-*.pyc
-__pycache__/
-*.pyo
-*.pyd
-.Python
-*.so
-*.egg-info/
-.eggs/
-.mypy_cache/
-.pytest_cache/
-.coverage
-coverage/
-
-# System files
-.DS_Store
-Thumbs.db
-*.tar.gz
-*.zip
-*.gz
-*.rar
-*.7z
+# Temporary files
+*.tmp
+*~
+```

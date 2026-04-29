@@ -152,13 +152,20 @@ local function updateElement(upvalueLog, index, value)
         return
     end
 
+    -- Only update if values actually changed to prevent unnecessary UI refreshes
+    local currentValueText = elementLog.Value.Label.Text
+    local newValueText = toString(value)
+    
+    if currentValueText ~= newValueText then
+        elementLog.Value.Label.Text = newValueText
+        elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
+        elementLog.Value.Icon.Image = oh.Constants.Types[elementValueType]
+    end
+    
+    -- Ensure consistent state
     elementLog.Index.Label.Text = indexText
-    elementLog.Value.Label.Text = toString(value)
     elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
-    elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
-    elementLog.Value.Icon.Image = oh.Constants.Types[elementIndexType]
-    elementLog.Value.Icon.Image = oh.Constants.Types[elementValueType]
-    elementLog.Parent = upvalueLog.Elements
+    elementLog.Index.Icon.Image = oh.Constants.Types[elementIndexType]
 end
 
 local function addUpvalue(upvalue, temporary)
@@ -251,7 +258,11 @@ local function updateUpvalue(closureLog, upvalue)
 
     if valueType == "function" then
         local closureName = getInfo(newValue).name or ''
-        upvalueLog.Value.Text = (closureName == '' and "Unnamed function") or closureName
+        local newValueText = (closureName == '' and "Unnamed function") or closureName
+        -- Only update if changed to prevent flickering
+        if upvalueLog.Value.Text ~= newValueText then
+            upvalueLog.Value.Text = newValueText
+        end
     elseif valueType == "table" and upvalue.Scanned then
         for i, v in pairs(upvalue.Scanned) do
             updateElement(upvalueLog, i, v)
@@ -265,7 +276,11 @@ local function updateUpvalue(closureLog, upvalue)
             end
         end
     else
-        upvalueLog.Value.Text = toString(newValue)
+        local newValueText = toString(newValue)
+        -- Only update if changed to prevent flickering
+        if upvalueLog.Value.Text ~= newValueText then
+            upvalueLog.Value.Text = newValueText
+        end
     end
 
     upvalueLog.Value.TextColor3 = oh.Constants.Syntax[valueType]
@@ -354,6 +369,8 @@ local function addUpvalues()
         
         local unnamedFunctions = {}
         local showResultLabel = false
+        local totalResults = 0
+        local maxInitialResults = 50 -- Limit initial results to prevent lag
 
         upvalueList:Clear()
         currentUpvalues = {}
@@ -361,21 +378,65 @@ local function addUpvalues()
         -- Use debounce to prevent lag during search
         local scanResults = Methods.Scan(query, deepSearchFlag)
         
+        -- Convert to array for controlled iteration
+        local resultsArray = {}
         for _i, closure in pairs(scanResults) do
-            if closure.Name == '' then
-                unnamedFunctions[closure.Data] = closure
-            else
+            table.insert(resultsArray, closure)
+        end
+        
+        local resultCount = #resultsArray
+        
+        -- Process results in batches to prevent freezing
+        local processed = 0
+        local batchSize = 20
+        
+        while processed < resultCount do
+            local batchEnd = math.min(processed + batchSize, resultCount)
+            
+            for i = processed + 1, batchEnd do
+                local closure = resultsArray[i]
+                if closure.Name == '' then
+                    unnamedFunctions[closure.Data] = closure
+                else
+                    Log.new(closure)
+                end
+                totalResults = totalResults + 1
+            end
+            
+            processed = batchEnd
+            
+            -- Yield to prevent freezing if more results to process
+            if processed < resultCount then
+                task.wait(0.01)
+            end
+        end
+
+        -- Add unnamed functions in batches too
+        local unnamedArray = {}
+        for _i, closure in pairs(unnamedFunctions) do
+            table.insert(unnamedArray, closure)
+        end
+        
+        processed = 0
+        local unnamedCount = #unnamedArray
+        
+        while processed < unnamedCount do
+            local batchEnd = math.min(processed + batchSize, unnamedCount)
+            
+            for i = processed + 1, batchEnd do
+                local closure = unnamedArray[i]
                 Log.new(closure)
             end
-
-            showResultLabel = true
+            
+            processed = batchEnd
+            
+            if processed < unnamedCount then
+                task.wait(0.01)
+            end
         end
 
-        for _i, closure in pairs(unnamedFunctions) do
-            Log.new(closure)
-        end
-
-        ResultStatus.Visible = showResultLabel
+        ResultStatus.Visible = (totalResults > 0)
+        ResultStatus.Label.Text = string.format("Found %d result%s", totalResults, totalResults ~= 1 and "s" or "")
 
         upvalueList:Recalculate()
         
@@ -726,7 +787,7 @@ changeElementContext:SetCallback(function()
     end
 end)
 
--- Optimized smooth update loop with better performance
+-- Optimized smooth update loop with better performance and scroll fix
 oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
     -- Only update if the page is visible
     if not isVisible then
@@ -754,10 +815,27 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
             break
         end
         
-        -- Check if the log still exists before updating
+        -- Check if the log still exists and is visible in the viewport before updating
         if closureLog and closureLog.Instance and closureLog.Instance.Parent then
-            closureLog:Update()
-            updateCount = updateCount + 1
+            -- Only update if the instance is within or near the visible area
+            -- This prevents updating off-screen elements that cause stuck text
+            local clip = ResultsClip
+            if clip then
+                local absPos = closureLog.Instance.AbsolutePosition.Y
+                local absSize = closureLog.Instance.AbsoluteSize.Y
+                local clipTop = clip.AbsolutePosition.Y
+                local clipBottom = clipTop + clip.AbsoluteSize.Y
+                
+                -- Update if visible or within buffer zone (200px above/below)
+                if absPos + absSize >= clipTop - 200 and absPos <= clipBottom + 200 then
+                    closureLog:Update()
+                    updateCount = updateCount + 1
+                end
+            else
+                -- Fallback: update anyway if clip doesn't exist
+                closureLog:Update()
+                updateCount = updateCount + 1
+            end
         end
     end
 end)
@@ -790,13 +868,17 @@ local function onPageVisible(visible)
         scanDebounce = false
         
         -- Clear focus from search box to prevent text sticking
-        SearchBox:ReleaseFocus()
+        if SearchBox and SearchBox.Parent then
+            SearchBox:ReleaseFocus()
+        end
         
-        -- Force UI to refresh and clear any stuck elements
+        -- Force UI to refresh and clear any stuck elements with multiple cleanup passes
         task.spawn(function()
-            task.wait(0.05)
-            if SearchBox and SearchBox.Parent then
-                SearchBox:ReleaseFocus()
+            for i = 1, 3 do
+                task.wait(0.02)
+                if SearchBox and SearchBox.Parent then
+                    SearchBox:ReleaseFocus()
+                end
             end
         end)
     end
@@ -814,14 +896,14 @@ TabSelector.SelectTab = function(tabName)
 
     -- Show new page if it's UpvalueScanner
     if tabName == "UpvalueScanner" and result then
-        task.wait(0.05) -- Reduced delay for snappier response
+        task.wait(0.02) -- Reduced delay for snappier response
         onPageVisible(true)
     end
 
     return result
 end
 
--- Also listen for direct page visibility changes
+-- Also listen for direct page visibility changes with better cleanup
 if Page:GetPropertyChangedSignal("Visible") then
     Page:GetPropertyChangedSignal("Visible"):Connect(function()
         if not Page.Visible and isVisible then
@@ -834,7 +916,7 @@ end
 
 -- Initial visibility check with faster response
 task.spawn(function()
-    task.wait(0.1)
+    task.wait(0.05)
     local currentPage = Pages and Pages.UpvalueScanner
     if currentPage and currentPage.Visible then
         onPageVisible(true)
