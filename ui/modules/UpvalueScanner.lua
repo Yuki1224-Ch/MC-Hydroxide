@@ -152,7 +152,7 @@ local function updateElement(upvalueLog, index, value)
         return
     end
 
-    -- Force refresh to prevent stuck text
+    -- Force refresh to prevent stuck text by clearing first
     local newValueText = toString(value)
     elementLog.Value.Label.Text = ""
     task.defer(function()
@@ -163,10 +163,15 @@ local function updateElement(upvalueLog, index, value)
         end
     end)
     
-    -- Ensure consistent state
-    elementLog.Index.Label.Text = indexText
-    elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
-    elementLog.Index.Icon.Image = oh.Constants.Types[elementIndexType]
+    -- Ensure consistent state for index
+    elementLog.Index.Label.Text = ""
+    task.defer(function()
+        if elementLog and elementLog.Parent then
+            elementLog.Index.Label.Text = indexText
+            elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
+            elementLog.Index.Icon.Image = oh.Constants.Types[elementIndexType]
+        end
+    end)
 end
 
 local function addUpvalue(upvalue, temporary)
@@ -257,16 +262,22 @@ local function updateUpvalue(closureLog, upvalue)
     local newValue = getUpvalue(closure, index)
     local valueType = type(newValue)
 
+    -- Force text refresh by clearing first, then setting new value
+    local function setTextSafely(label, newText)
+        if label and label.Parent then
+            label.Text = ""
+            task.defer(function()
+                if label and label.Parent then
+                    label.Text = newText
+                end
+            end)
+        end
+    end
+
     if valueType == "function" then
         local closureName = getInfo(newValue).name or ''
         local newValueText = (closureName == '' and "Unnamed function") or closureName
-        -- Force refresh to prevent stuck text
-        upvalueLog.Value.Text = ""
-        task.defer(function()
-            if upvalueLog and upvalueLog.Parent then
-                upvalueLog.Value.Text = newValueText
-            end
-        end)
+        setTextSafely(upvalueLog.Value, newValueText)
     elseif valueType == "table" and upvalue.Scanned then
         for i, v in pairs(upvalue.Scanned) do
             updateElement(upvalueLog, i, v)
@@ -281,13 +292,7 @@ local function updateUpvalue(closureLog, upvalue)
         end
     else
         local newValueText = toString(newValue)
-        -- Force refresh to prevent stuck text
-        upvalueLog.Value.Text = ""
-        task.defer(function()
-            if upvalueLog and upvalueLog.Parent then
-                upvalueLog.Value.Text = newValueText
-            end
-        end)
+        setTextSafely(upvalueLog.Value, newValueText)
     end
 
     upvalueLog.Value.TextColor3 = oh.Constants.Syntax[valueType]
@@ -347,7 +352,12 @@ function Log.update(log)
     -- Force text refresh at the start of each update to prevent stuck text
     local nameLabel = log.Instance:FindFirstChild("Name")
     if nameLabel then
-        nameLabel.Text = nameLabel.Text
+        nameLabel.Text = ""
+        task.defer(function()
+            if nameLabel and nameLabel.Parent then
+                nameLabel.Text = log.Closure.Name or nameLabel.Text
+            end
+        end)
     end
     
     for _i, upvalue in pairs(log.Closure.Upvalues) do
@@ -801,11 +811,13 @@ changeElementContext:SetCallback(function()
     end
 end)
 
--- Optimized smooth update loop with better performance and scroll fix
+-- Optimized smooth update loop with improved scroll handling and text refresh
 local visibleClosureLogs = {}
 local lastScrollPosition = 0
-local scrollCheckInterval = 0.1
+local scrollCheckInterval = 0.05
 local lastScrollCheck = 0
+local cacheRefreshInterval = 0.2
+local lastCacheRefresh = 0
 
 oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
     -- Only update if the page is visible
@@ -818,31 +830,34 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
         return
     end
     
-    -- Check scroll position periodically to invalidate cache
     local currentTime = tick()
+    
+    -- Check scroll position periodically to invalidate cache
     if ResultsClip then
         local currentScroll = ResultsClip.CanvasPosition.Y
-        if currentScroll ~= lastScrollPosition then
+        
+        -- Detect scroll movement
+        if math.abs(currentScroll - lastScrollPosition) > 1 then
             lastScrollPosition = currentScroll
-            -- Clear visible cache when scrolling to prevent stuck text
+            lastScrollCheck = currentTime
+            -- Clear visible cache when scrolling to force fresh updates
             visibleClosureLogs = {}
         end
         
-        -- Periodic cache refresh even without scroll
-        if currentTime - lastScrollCheck > scrollCheckInterval then
-            lastScrollCheck = currentTime
-            -- Refresh visible cache every 0.1 seconds
+        -- Periodic cache refresh even without scroll to prevent stuck text
+        if currentTime - lastCacheRefresh > cacheRefreshInterval then
+            lastCacheRefresh = currentTime
             visibleClosureLogs = {}
         end
     end
     
-    -- Smooth time-based updates instead of frame-based
+    -- Smooth time-based updates
     if currentTime - lastUpdateTime < updateInterval then
         return
     end
     lastUpdateTime = currentTime
     
-    -- Get current visible range more accurately
+    -- Get current visible range
     local clip = ResultsClip
     local viewportTop = 0
     local viewportBottom = 0
@@ -854,7 +869,7 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
     
     -- Batch updates for smoother performance
     local updateCount = 0
-    local maxUpdatesPerFrame = 10 -- Slightly increased for responsiveness
+    local maxUpdatesPerFrame = 8
     
     for _i, closureLog in pairs(currentUpvalues) do
         if updateCount >= maxUpdatesPerFrame then
@@ -864,22 +879,29 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
         -- Check if the log still exists and is valid
         if closureLog and closureLog.Instance and closureLog.Instance.Parent then
             local instance = closureLog.Instance
+            
+            -- Skip invisible items (search filtered out)
+            if not instance.Visible then
+                visibleClosureLogs[closureLog] = nil
+                goto continue
+            end
+            
             local absPos = instance.AbsolutePosition.Y
             local absSize = instance.AbsoluteSize.Y
             
-            -- More generous buffer zone to prevent stuck text during fast scrolling
-            local bufferZone = 300
+            -- Buffer zone for preloading
+            local bufferZone = 250
             
             -- Check if within or near visible area
             local isInView = (absPos + absSize >= viewportTop - bufferZone) and (absPos <= viewportBottom + bufferZone)
             
             if isInView then
-                -- Always update visible items to prevent stuck text
+                -- Force update visible items to prevent stuck text
                 closureLog:Update()
                 updateCount = updateCount + 1
                 visibleClosureLogs[closureLog] = true
             elseif visibleClosureLogs[closureLog] then
-                -- Item was visible but now scrolled away - do one final update to ensure clean state
+                -- Item was visible but now scrolled away - final update then remove from cache
                 closureLog:Update()
                 visibleClosureLogs[closureLog] = nil
             end
@@ -887,6 +909,8 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
             -- Clean up invalid entries
             visibleClosureLogs[closureLog] = nil
         end
+        
+        ::continue::
     end
 end)
 
