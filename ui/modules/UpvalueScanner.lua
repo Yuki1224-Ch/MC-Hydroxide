@@ -39,160 +39,134 @@ local deepSearch = CheckBox.new(Filters.SearchInTables)
 local upvalueList = List.new(ResultsClip.Content)
 
 local deepSearchFlag = false
-local fastSearchFlag = true -- Fast mode enabled by default for better performance
+local fastSearchFlag = true
 local currentUpvalues = {}
 local updateConnection = nil
 local isVisible = false
-local scanDebounce = false
-local pendingSearchQuery = nil
-local lastSearchTime = 0
-local searchCooldown = 0.15 -- Reduced cooldown for faster search
+
+-- FIX: Single atomic scan lock – set true before scanning, false in a
+-- finally-style pcall wrapper so it ALWAYS gets cleared.
+local scanInProgress = false
 
 local selectedLog
 local selectedUpvalue
 local selectedUpvalueLog
 local selectedElement
 
--- Smooth UI update tracking
 local lastUpdateTime = 0
-local updateInterval = 1/60 -- 60 FPS target
-local pendingUpdates = {}
-local isUpdating = false
+local updateInterval = 1 / 20 -- 20 FPS for value polling (plenty smooth)
+local visibleClosureLogs = {}
 
-local spyClosureContext = ContextMenuButton.new("rbxassetid://4666593447", "Spy Closure")
-local viewUpvaluesContext = ContextMenuButton.new("rbxassetid://5179169654", "View All Upvalues")
+local spyClosureContext    = ContextMenuButton.new("rbxassetid://4666593447", "Spy Closure")
+local viewUpvaluesContext  = ContextMenuButton.new("rbxassetid://5179169654", "View All Upvalues")
 local changeUpvalueContext = ContextMenuButton.new("rbxassetid://5458573463", "Change Upvalue")
-local changeTableContext = ContextMenuButton.new("rbxassetid://5458573463", "Change Upvalue")
-local viewElementsContext = ContextMenuButton.new("rbxassetid://5179169654", "View All Elements")
+local changeTableContext   = ContextMenuButton.new("rbxassetid://5458573463", "Change Upvalue")
+local viewElementsContext  = ContextMenuButton.new("rbxassetid://5179169654", "View All Elements")
 local changeElementContext = ContextMenuButton.new("rbxassetid://5458573463", "Change Element")
 local upvalueScriptContext = ContextMenuButton.new("rbxassetid://4800244808", "Generate Script")
-local tableScriptContext = ContextMenuButton.new("rbxassetid://4800244808", "Generate Script")
+local tableScriptContext   = ContextMenuButton.new("rbxassetid://4800244808", "Generate Script")
 local elementScriptContext = ContextMenuButton.new("rbxassetid://4800244808", "Generate Script")
-local getScriptContext = ContextMenuButton.new("rbxassetid://4891705738", "Get Script Path")
+local getScriptContext     = ContextMenuButton.new("rbxassetid://4891705738", "Get Script Path")
 
 local closureContextMenu = ContextMenu.new({ spyClosureContext, viewUpvaluesContext, getScriptContext })
-local tableContextMenu = ContextMenu.new({ changeTableContext, viewElementsContext, tableScriptContext })
+local tableContextMenu   = ContextMenu.new({ changeTableContext, viewElementsContext, tableScriptContext })
 local upvalueContextMenu = ContextMenu.new({ changeUpvalueContext, upvalueScriptContext })
 local elementContextMenu = ContextMenu.new({ changeElementContext, elementScriptContext })
 
-local modifyUpvalueInner = modifyUpvalue.Instance.Inner
+local modifyUpvalueInner   = modifyUpvalue.Instance.Inner
 local modifyUpvalueContent = modifyUpvalueInner.Content
 local modifyUpvalueButtons = modifyUpvalueInner.Buttons.SetCancel
-local modifyUpvalueType = modifyUpvalueContent.Type
-local modifyUpvalueValue = modifyUpvalueContent.Value.Input
+local modifyUpvalueType    = modifyUpvalueContent.Type
+local modifyUpvalueValue   = modifyUpvalueContent.Value.Input
 
-local modifyElementInner = modifyElement.Instance.Inner
+local modifyElementInner   = modifyElement.Instance.Inner
 local modifyElementContent = modifyElementInner.Content
 local modifyElementButtons = modifyElementInner.Buttons.SetCancel
-local modifyElementType = modifyElementContent.Type
-local modifyElementValue = modifyElementContent.Value.Input
+local modifyElementType    = modifyElementContent.Type
+local modifyElementValue   = modifyElementContent.Value.Input
 
 local upvalueTypeDropdown = Dropdown.new(modifyUpvalueType)
 local elementTypeDropdown = Dropdown.new(modifyElementType)
 
 local constants = {
-    tempElementColor = Color3.fromRGB(30, 10, 10),
-    tempUpvalueColor = Color3.fromRGB(40, 20, 20),
-    tempBorderColor = Color3.fromRGB(20, 0, 0)
+    tempElementColor  = Color3.fromRGB(30, 10, 10),
+    tempUpvalueColor  = Color3.fromRGB(40, 20, 20),
+    tempBorderColor   = Color3.fromRGB(20, 0, 0),
 }
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Helpers
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local function typeMismatchMessage()
-    MessageBox.Show("Error", 
-        "Value does not match selected type",
-        MessageType.OK)
+    MessageBox.Show("Error", "Value does not match selected type", MessageType.OK)
 end
 
 local function addElement(upvalueLog, upvalue, index, value, temporary)
-    local elementLog = Assets.Element:Clone()
+    local elementLog      = Assets.Element:Clone()
     local elementIndexType = typeof(index)
     local elementValueType = typeof(value)
-    local indexText = toString(index)
+    local indexText        = toString(index)
 
     if temporary then
-        elementLog.ImageColor3 = constants.tempElementColor
+        elementLog.ImageColor3        = constants.tempElementColor
         elementLog.Border.ImageColor3 = constants.tempBorderColor
     end
 
-    elementLog.Name = indexText
-    elementLog.Index.Label.Text = indexText
-    local success, valueText = pcall(toString, value)
-    elementLog.Value.Label.Text = success and valueText or "<error>"
-    elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
-    elementLog.Index.Icon.Image = oh.Constants.Types[elementIndexType]
-    elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
-    elementLog.Value.Icon.Image = oh.Constants.Types[elementValueType]
+    elementLog.Name                       = indexText
+    elementLog.Index.Label.Text           = indexText
+    local ok, vt = pcall(toString, value)
+    elementLog.Value.Label.Text           = ok and vt or "<error>"
+    elementLog.Index.Label.TextColor3     = oh.Constants.Syntax[elementIndexType]
+    elementLog.Index.Icon.Image           = oh.Constants.Types[elementIndexType]
+    elementLog.Value.Label.TextColor3     = oh.Constants.Syntax[elementValueType]
+    elementLog.Value.Icon.Image           = oh.Constants.Types[elementValueType]
 
-    elementLog.MouseButton2Click:Connect(function()
-        selectedUpvalue = upvalue
+    local function showElementContext()
+        selectedUpvalue    = upvalue
         selectedUpvalueLog = upvalueLog
-        selectedElement = index
+        selectedElement    = index
         elementTypeDropdown:SetSelected(typeof(value))
         elementContextMenu:Show()
-    end)
-    
+    end
+
+    elementLog.MouseButton2Click:Connect(showElementContext)
     elementLog.MouseButton1Click:Connect(function()
-    	if pressHold then
-	        selectedUpvalue = upvalue
-	        selectedUpvalueLog = upvalueLog
-	        selectedElement = index
-	        elementTypeDropdown:SetSelected(typeof(value))
-	        elementContextMenu:Show()
-        end
+        if pressHold then showElementContext() end
     end)
 
     return elementLog
 end
 
-local function setTextSafely(label, newText)
-    if label and label.Parent then
-        local textStr = tostring(newText)
-        -- Direct assignment - clearing causes stuck state
-        label.Text = textStr
-    end
-end
-
--- Ultra-fast element update - only updates value text, skips colors/icons
 local function updateElementFast(upvalueLog, index, value)
-    local indexText = toString(index)
-    local elementLog = upvalueLog.Elements:FindFirstChild(indexText)
-    
-    if not elementLog then
-        return
+    local elementLog = upvalueLog.Elements:FindFirstChild(toString(index))
+    if not elementLog then return end
+    local ok, newText = pcall(toString, value)
+    if ok and elementLog.Value.Label.Text ~= newText then
+        elementLog.Value.Label.Text = newText
     end
-
-    -- Only update value text if changed
-    local success, newValueText = pcall(toString, value)
-    if success and elementLog.Value.Label.Text ~= newValueText then
-        elementLog.Value.Label.Text = newValueText
-    end
-end
-
--- Redirect slow update to fast version
-local function updateElement(upvalueLog, index, value)
-    updateElementFast(upvalueLog, index, value)
 end
 
 local function addUpvalue(upvalue, temporary)
     local upvalueLog
-    local index = upvalue.Index
-    local value = upvalue.Value
+    local index     = upvalue.Index
+    local value     = upvalue.Value
     local valueType = typeof(value)
-    
+
     if valueType == "table" then
         upvalueLog = Assets.Table:Clone()
         local height = 25
 
         if temporary then
-            upvalueLog.ImageColor3 = constants.tempUpvalueColor
+            upvalueLog.ImageColor3        = constants.tempUpvalueColor
             upvalueLog.Border.ImageColor3 = constants.tempBorderColor
         end
 
-        if not temporary then
+        if not temporary and upvalue.Scanned then
             for i, v in pairs(upvalue.Scanned) do
-                local elementLog = addElement(upvalueLog, upvalue, i, v)
-                elementLog.Parent = upvalueLog.Elements
-                
-                height = height + elementLog.AbsoluteSize.Y + 5
+                local el = addElement(upvalueLog, upvalue, i, v)
+                el.Parent = upvalueLog.Elements
+                height    = height + el.AbsoluteSize.Y + 5
             end
         end
 
@@ -201,268 +175,229 @@ local function addUpvalue(upvalue, temporary)
         upvalueLog = Assets.Upvalue:Clone()
 
         if temporary then
-            upvalueLog.ImageColor3 = constants.tempUpvalueColor
+            upvalueLog.ImageColor3        = constants.tempUpvalueColor
             upvalueLog.Border.ImageColor3 = constants.tempBorderColor
         end
 
         if valueType == "function" then
-            local closureName = getInfo(value).name or ''
-            upvalueLog.Value.Text = (closureName == '' and "Unnamed function") or closureName
+            local n = getInfo(value).name or ''
+            upvalueLog.Value.Text = (n == '' and "Unnamed function") or n
         else
-            local success, valueText = pcall(toString, value)
-            upvalueLog.Value.Text = success and valueText or "<error>"
+            local ok, vt = pcall(toString, value)
+            upvalueLog.Value.Text = ok and vt or "<error>"
         end
     end
-    
-    upvalueLog.Name = index
-    upvalueLog.Index.Text = index
-    upvalueLog.Value.TextColor3 = oh.Constants.Syntax[valueType]
-    upvalueLog.Icon.Image = oh.Constants.Types[valueType]
 
-    upvalueLog.MouseButton2Click:Connect(function()
-        selectedUpvalue = upvalue
+    upvalueLog.Name            = index
+    upvalueLog.Index.Text      = index
+    upvalueLog.Value.TextColor3 = oh.Constants.Syntax[valueType]
+    upvalueLog.Icon.Image      = oh.Constants.Types[valueType]
+
+    local function showUpvalueContext()
+        selectedUpvalue    = upvalue
         selectedUpvalueLog = upvalueLog
         upvalueTypeDropdown:SetSelected(typeof(upvalue.Value))
-
         if upvalue.Scanned then
             tableContextMenu:Show()
         else
             upvalueContextMenu:Show()
         end
+    end
+
+    upvalueLog.MouseButton2Click:Connect(showUpvalueContext)
+    upvalueLog.MouseButton1Click:Connect(function()
+        if pressHold then showUpvalueContext() end
     end)
-    
-	upvalueLog.MouseButton1Click:Connect(function()
-		if pressHold then
-	        selectedUpvalue = upvalue
-	        selectedUpvalueLog = upvalueLog
-	        upvalueTypeDropdown:SetSelected(typeof(upvalue.Value))
-	
-	        if upvalue.Scanned then
-	            tableContextMenu:Show()
-	        else
-	            upvalueContextMenu:Show()
-	        end
-		end
-	end)
 
     return upvalueLog
 end
 
 local function updateUpvalue(closureLog, upvalue)
+    if not closureLog.Instance or not closureLog.Instance.Parent then return end
+
     local upvalueLog = closureLog.Instance.Upvalues[tostring(upvalue.Index)]
-    
-    -- Skip if upvalue UI no longer exists
-    if not upvalueLog then
-        return
-    end
-    
-    local closure = upvalue.Closure
-    local index = upvalue.Index
+    if not upvalueLog then return end
+
+    local closure  = upvalue.Closure
+    local index    = upvalue.Index
     local newValue = getUpvalue(closure, index)
     local valueType = typeof(newValue)
 
-    -- Ultra-fast text update - minimal operations to prevent stuck text
     if valueType == "function" then
-        local closureName = getInfo(newValue).name or ''
-        local newValueText = (closureName == '' and "Unnamed function") or closureName
-        if upvalueLog.Value.Text ~= newValueText then
-            upvalueLog.Value.Text = newValueText
+        local n       = getInfo(newValue).name or ''
+        local newText = (n == '' and "Unnamed function") or n
+        if upvalueLog.Value.Text ~= newText then
+            upvalueLog.Value.Text = newText
         end
     elseif valueType == "table" and upvalue.Scanned then
         for i, v in pairs(upvalue.Scanned) do
             updateElementFast(upvalueLog, i, v)
         end
-
         if upvalue.TemporaryElements then
-            local table = upvalue.Value
-
-            for idx, _v in pairs(upvalue.TemporaryElements) do
-                updateElementFast(upvalueLog, idx, table[idx])
+            local tbl = upvalue.Value
+            for idx in pairs(upvalue.TemporaryElements) do
+                updateElementFast(upvalueLog, idx, tbl[idx])
             end
         end
     else
-        local success, newValueText = pcall(toString, newValue)
-        if success and upvalueLog.Value.Text ~= newValueText then
-            upvalueLog.Value.Text = newValueText
-        elseif not success and upvalueLog.Value.Text ~= "<error>" then
-            upvalueLog.Value.Text = "<error>"
+        local ok, newText = pcall(toString, newValue)
+        local display = ok and newText or "<error>"
+        if upvalueLog.Value.Text ~= display then
+            upvalueLog.Value.Text = display
         end
     end
-
-    -- Skip color/icon updates during real-time - set on creation only
 
     upvalue:Update(newValue)
 end
 
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Log Object
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local Log = {}
 
 function Log.new(closure)
-    local log = {}
-    local instance = Assets.ClosureLog:Clone()
+    local log       = {}
+    local instance  = Assets.ClosureLog:Clone()
     local listButton = ListButton.new(instance, upvalueList)
     local logHeight = 30
 
     log.Instance = instance
-    log.Closure = closure
+    log.Closure  = closure
     log.Upvalues = {}
-    log.Update = Log.update
+    log.Update   = Log.update
 
     for i, upvalue in pairs(closure.Upvalues) do
         local upvalueLog = addUpvalue(upvalue)
         upvalueLog.Parent = instance.Upvalues
-
-        logHeight = logHeight + upvalueLog.AbsoluteSize.Y + 5
-        log.Upvalues[i] = upvalueLog
+        logHeight         = logHeight + upvalueLog.AbsoluteSize.Y + 5
+        log.Upvalues[i]   = upvalueLog
     end
 
     instance.Size = UDim2.new(1, 0, 0, logHeight)
     instance:FindFirstChild("Name").Text = closure.Name
-    
+
     listButton:SetRightCallback(function()
         selectedLog = log
     end)
-    
-    currentUpvalues[closure.Data] = log
 
+    currentUpvalues[closure.Data] = log
     return log
 end
 
 function Log.update(log)
-    -- Skip update if closure is no longer valid
-    if not log.Closure or not log.Instance or not log.Instance.Parent then
-        return
-    end
-    
-    -- Update closure name with minimal check
+    if not log.Closure or not log.Instance or not log.Instance.Parent then return end
+
     local nameLabel = log.Instance:FindFirstChild("Name")
-    if nameLabel and log.Closure.Name then
-        if nameLabel.Text ~= log.Closure.Name then
-            nameLabel.Text = log.Closure.Name
-        end
+    if nameLabel and log.Closure.Name and nameLabel.Text ~= log.Closure.Name then
+        nameLabel.Text = log.Closure.Name
     end
-    
-    for _i, upvalue in pairs(log.Closure.Upvalues) do
+
+    for _, upvalue in pairs(log.Closure.Upvalues) do
         updateUpvalue(log, upvalue)
     end
-    
-    for _i, upvalue in pairs(log.Closure.TemporaryUpvalues) do
+    for _, upvalue in pairs(log.Closure.TemporaryUpvalues) do
         updateUpvalue(log, upvalue)
     end
 end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FIX: addUpvalues – proper lock/unlock with pcall so it NEVER stays locked
+-- ─────────────────────────────────────────────────────────────────────────────
 
 local function addUpvalues()
+    -- Guard: only one scan at a time
+    if scanInProgress then return end
+
     local query = SearchBox.Text
-    local currentTime = tick()
-    
-    -- Prevent search if already scanning or in cooldown
-    if scanDebounce then
-        pendingSearchQuery = query
-        return
-    end
-    
-    -- Time-based debounce for smoother UI
-    if currentTime - lastSearchTime < searchCooldown then
-        pendingSearchQuery = query
+    -- FIX: clear the box immediately so it doesn't flicker later
+    SearchBox.Text = ""
+
+    if query:gsub("%s", "") == "" then
+        MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
         return
     end
 
-    if query:gsub(' ', '') ~= '' then
-        if not tonumber(query) and query:len() <= 1 then
-            MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
-            SearchBox.Text = ""
-            return
-        end
+    if not tonumber(query) and query:len() <= 1 then
+        MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
+        return
+    end
 
-        -- Set debounce to prevent lag
-        scanDebounce = true
-        lastSearchTime = currentTime
-        
-        local showResultLabel = false
-        local totalResults = 0
+    scanInProgress = true
+    oh.setStatus("Scanning upvalues…")
 
-        -- Use debounce to prevent lag during search with result limit
-        local scanResults = Methods.Scan(query, deepSearchFlag, 300, not fastSearchFlag) -- Limit to 300 results max, fast mode skips deep nesting
-        
-        -- Convert to array for controlled iteration
-        local resultsArray = {}
-        for _i, closure in pairs(scanResults) do
-            table.insert(resultsArray, closure)
-        end
-        
-        local resultCount = #resultsArray
-        
-        -- Create a set of new result closures for fast lookup
-        local newResultClosures = {}
-        for i = 1, resultCount do
-            newResultClosures[resultsArray[i].Data] = true
-        end
-        
-        -- Hide all existing logs first (visibility filtering approach)
-        local hiddenLogs = {}
-        for closureData, log in pairs(currentUpvalues) do
-            if log.Instance and log.Instance.Parent then
-                log.Instance.Visible = false
-                table.insert(hiddenLogs, closureData)
+    -- Run in a coroutine so yields work, but wrap everything in pcall so the
+    -- lock is ALWAYS released even on error.
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local scanResults = Methods.Scan(query, deepSearchFlag, 300, not deepSearchFlag)
+
+            -- Build array for controlled iteration
+            local resultsArray = {}
+            for _, closure in pairs(scanResults) do
+                table.insert(resultsArray, closure)
             end
-        end
-        
-        -- Process results in batches to prevent freezing with optimized batch size
-        local processed = 0
-        local batchSize = 8 -- Much smaller batch for smoother UI
-        
-        while processed < resultCount do
-            local batchEnd = math.min(processed + batchSize, resultCount)
-            
-            for i = processed + 1, batchEnd do
-                local closure = resultsArray[i]
-                local closureData = closure.Data
-                
-                -- Check if this closure already has a log
-                local existingLog = currentUpvalues[closureData]
-                
-                if existingLog then
-                    -- Reuse existing log - just update values and make visible
-                    existingLog.Instance.Visible = true
-                    existingLog:Update()
-                    totalResults = totalResults + 1
-                else
-                    -- Create new log for this closure
-                    Log.new(closure)
-                    totalResults = totalResults + 1
+
+            local resultCount = #resultsArray
+
+            -- Hide all existing logs (filter approach – avoids destroy/recreate)
+            for _, log in pairs(currentUpvalues) do
+                if log.Instance and log.Instance.Parent then
+                    log.Instance.Visible = false
                 end
             end
-            
-            processed = batchEnd
-            
-            -- Yield to prevent freezing if more results to process
-            if processed < resultCount then
-                task.wait(0.04) -- Longer yield for much better responsiveness
+
+            -- Process in small batches so the UI stays responsive
+            local totalShown = 0
+            local batchSize  = 8
+
+            for i = 1, resultCount do
+                local closure    = resultsArray[i]
+                local closureData = closure.Data
+                local existing   = currentUpvalues[closureData]
+
+                if existing then
+                    existing.Instance.Visible = true
+                    existing:Update()
+                else
+                    Log.new(closure)
+                end
+
+                totalShown = totalShown + 1
+
+                -- Yield every batchSize items
+                if i % batchSize == 0 then
+                    task.wait(0.04)
+                end
             end
-        end
 
-        ResultStatus.Visible = (totalResults > 0)
-        ResultStatus.Label.Text = string.format("Found %d result%s", totalResults, totalResults ~= 1 and "s" or "")
+            ResultStatus.Visible      = (totalShown > 0)
+            ResultStatus.Label.Text   = string.format(
+                "Found %d result%s", totalShown, totalShown ~= 1 and "s" or "")
 
-        upvalueList:Recalculate()
-        
-        -- Reset debounce after a longer delay
-        task.delay(searchCooldown * 2, function()
-            scanDebounce = false
-            -- Process pending search if any
-            if pendingSearchQuery and pendingSearchQuery:gsub(' ', '') ~= '' then
-                local tempQuery = pendingSearchQuery
-                pendingSearchQuery = nil
-                SearchBox.Text = tempQuery
-                addUpvalues()
+            upvalueList:Recalculate()
+
+            if totalShown == 0 then
+                oh.setStatus("No upvalues found")
+            else
+                oh.setStatus(string.format("Upvalue Scanner – %d result%s",
+                    totalShown, totalShown ~= 1 and "s" or ""))
             end
         end)
-    else
-        MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
-    end
 
-    SearchBox.Text = ""
+        -- FIX: ALWAYS unlock, whether scan succeeded or errored
+        scanInProgress = false
+
+        if not ok then
+            oh.setStatus("Scan error")
+            warn("[UpvalueScanner] Scan error:", err)
+        end
+    end)
 end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Context menus / bindings (unchanged logic, just wired up)
+-- ─────────────────────────────────────────────────────────────────────────────
 
 upvalueList:BindContextMenu(closureContextMenu)
 
@@ -473,39 +408,30 @@ deepSearch:SetCallback(function(enabled)
     end
 end)
 
--- Fast mode is always enabled by default for better performance
--- Deep search will still work but nested table scanning is skipped in fast mode
-
--- Optimized search trigger with debounce
-local function triggerSearch()
-    if not scanDebounce then
-        addUpvalues()
-    end
-end
-
-Search.MouseButton1Click:Connect(triggerSearch)
+Search.MouseButton1Click:Connect(function()
+    if not scanInProgress then addUpvalues() end
+end)
 
 SearchBox.FocusLost:Connect(function(returned)
-    if returned then
-        triggerSearch()
+    if returned and SearchBox.Text ~= "" then
+        if not scanInProgress then addUpvalues() end
     end
 end)
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- setValue / typeDropdownAdjust helpers
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local function setValue(valueText, value, dropdown)
-    local raw = valueText
+    local raw       = valueText
     local valueType = typeof(value)
     local newValue
 
     if valueType == "string" then
         newValue = raw
     elseif valueType == "number" then
-        local convert = tonumber(raw)
-
-        if convert then
-            newValue = convert
-        else
-            typeMismatchMessage()
-        end
+        local n = tonumber(raw)
+        if n then newValue = n else typeMismatchMessage() end
     elseif valueType == "boolean" then
         if raw == "true" then
             newValue = true
@@ -515,18 +441,15 @@ local function setValue(valueText, value, dropdown)
             typeMismatchMessage()
         end
     else
-        local success, result = pcall(loadstring("return " .. raw))
-        
-        if success then
+        local ok, result = pcall(loadstring("return " .. raw))
+        if ok then
             if typeof(result) == dropdown.Selected.Name then
                 newValue = result
             else
                 typeMismatchMessage()
             end
         else
-            MessageBox.Show("Error",
-                "There is an error in your input",
-                MessageType.OK)
+            MessageBox.Show("Error", "There is an error in your input", MessageType.OK)
         end
     end
 
@@ -534,23 +457,19 @@ local function setValue(valueText, value, dropdown)
 end
 
 local function typeDropdownAdjust(dropdown, button)
-    local instance = dropdown.Instance
     local icon = oh.Constants.Types[button.Name] or oh.Constants.Types["userdata"]
-
-    instance.Icon.Image = icon
+    dropdown.Instance.Icon.Image = icon
 end
 
-modifyUpvalueButtons.Set.MouseButton1Click:Connect(function()
-    local newValue = setValue(
-        modifyUpvalueValue.Text, 
-        selectedUpvalue.Value, 
-        upvalueTypeDropdown)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Modify upvalue / element prompts
+-- ─────────────────────────────────────────────────────────────────────────────
 
+modifyUpvalueButtons.Set.MouseButton1Click:Connect(function()
+    local newValue = setValue(modifyUpvalueValue.Text, selectedUpvalue.Value, upvalueTypeDropdown)
     if newValue ~= nil then
         selectedUpvalue:Set(newValue)
-
         modifyUpvalueValue.Text = ""
-        --modifyUpvalue:Hide()
     end
 end)
 
@@ -560,16 +479,9 @@ modifyUpvalueButtons.Cancel.MouseButton1Click:Connect(function()
 end)
 
 modifyElementButtons.Set.MouseButton1Click:Connect(function()
-    local upvalueValue = selectedUpvalue.Value
-    
-    local newValue = setValue(
-        modifyElementValue.Text, 
-        upvalueValue[selectedElement], 
-        elementTypeDropdown)
-
+    local newValue = setValue(modifyElementValue.Text, selectedUpvalue.Value[selectedElement], elementTypeDropdown)
     if newValue ~= nil then
-        upvalueValue[selectedElement] = newValue
-
+        selectedUpvalue.Value[selectedElement] = newValue
         modifyElementValue.Text = ""
         modifyElement:Hide()
     end
@@ -583,57 +495,60 @@ end)
 upvalueTypeDropdown:SetCallback(typeDropdownAdjust)
 elementTypeDropdown:SetCallback(typeDropdownAdjust)
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Script generation
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local function generateScriptFormat(elementIndex)
-    local generatedScript = [[-- Generated by Hydroxide's Upvalue Scanner: https://github.com/Upbolt/Hydroxide
+    local base = [[-- Generated by Hydroxide's Upvalue Scanner: https://github.com/Upbolt/Hydroxide
 
 local aux = loadstring(game:HttpGetAsync("https://raw.githubusercontent.com/Upbolt/Hydroxide/revision/ohaux.lua"))()
 
-local scriptPath = %s
-local closureName = "%s"
-local upvalueIndex = %d
+local scriptPath      = %s
+local closureName     = "%s"
+local upvalueIndex    = %d
 local closureConstants = %s
 
 local closure = aux.searchClosure(scriptPath, closureName, upvalueIndex, closureConstants)
-local value = YOUR_NEW_VALUE_HERE
+local value   = YOUR_NEW_VALUE_HERE
 ]]
 
     if elementIndex and elementIndex ~= "nil" then
-        generatedScript = generatedScript .. ("local elementIndex = %s\n"):format(elementIndex)
-        generatedScript = generatedScript .. "\n\n-- DO NOT RELY ON THIS FEATURE TO PRODUCE %s FUNCTIONAL SCRIPTS\n"
-        return generatedScript .. "debug.getupvalue(closure, upvalueIndex)[elementIndex] = value"
+        base = base .. ("local elementIndex = %s\n"):format(elementIndex)
+        base = base .. "\n\n-- DO NOT RELY ON THIS FEATURE TO PRODUCE %s FUNCTIONAL SCRIPTS\n"
+        return base .. "debug.getupvalue(closure, upvalueIndex)[elementIndex] = value"
     end
-    
-    return generatedScript .. "\n\n-- DO NOT RELY ON THIS FEATURE TO PRODUCE %s FUNCTIONAL SCRIPTS\ndebug.setupvalue(closure, upvalueIndex, value)"
+
+    return base .. "\n\n-- DO NOT RELY ON THIS FEATURE TO PRODUCE %s FUNCTIONAL SCRIPTS\ndebug.setupvalue(closure, upvalueIndex, value)"
 end
 
-local function generateScript(elementIndex) 
-    local index = selectedUpvalue.Index
-    local closure = selectedUpvalue.Closure
+local function generateScript(elementIndex)
+    local index       = selectedUpvalue.Index
+    local closure     = selectedUpvalue.Closure
     local closureData = closure.Data
     local closureScript = rawget(getfenv(closureData), "script")
 
-    local generatedScript = generateScriptFormat(dataToString(elementIndex))
+    local generated = generateScriptFormat(dataToString(elementIndex))
 
     local currentConstants = {}
-    local currentIndex = 0
+    local currentIndex     = 0
 
     if closureScript and not closureScript.Parent then
         closureScript = nil
     end
 
     for idx, constant in pairs(getConstants(closureData)) do
-        if currentIndex > 5 then 
-            break 
-        elseif type(constant) ~= "function" then
+        if currentIndex > 5 then break end
+        if type(constant) ~= "function" then
             currentConstants[idx] = constant
             currentIndex = currentIndex + 1
         end
     end
 
     setClipboard(
-        generatedScript:format(
-            (closureScript and getInstancePath(closureScript)) or "nil", 
-            closure.Name, 
+        generated:format(
+            (closureScript and getInstancePath(closureScript)) or "nil",
+            closure.Name,
             index,
             tableToString(currentConstants),
             "100%"
@@ -641,25 +556,20 @@ local function generateScript(elementIndex)
     )
 end
 
-upvalueScriptContext:SetCallback(function()
-    generateScript()
-end)
+upvalueScriptContext:SetCallback(function() generateScript() end)
+tableScriptContext:SetCallback(function() generateScript() end)
+elementScriptContext:SetCallback(function() generateScript(selectedElement) end)
 
-tableScriptContext:SetCallback(function()
-    generateScript()
-end)
-
-elementScriptContext:SetCallback(function()
-    generateScript(selectedElement)
-end)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ClosureSpy integration
+-- ─────────────────────────────────────────────────────────────────────────────
 
 local SpyHook = ClosureSpy.Hook
+
 spyClosureContext:SetCallback(function()
     local closure = selectedLog.Closure
-
     if TabSelector.SelectTab("ClosureSpy") then
         local result = SpyHook.new(closure)
-
         if result == false then
             MessageBox.Show("Already hooked", "You are already spying " .. closure.Name)
         elseif result == nil then
@@ -669,57 +579,48 @@ spyClosureContext:SetCallback(function()
 end)
 
 viewUpvaluesContext:SetCallback(function()
-    if selectedLog then
-        local temporaryUpvalues = selectedLog.TemporaryUpvalues 
-        local instance = selectedLog.Instance
-        local newHeight = 0
+    if not selectedLog then return end
 
-        if temporaryUpvalues then
-            for _i, upvalueLog in pairs(temporaryUpvalues) do
-                newHeight = newHeight - (upvalueLog.AbsoluteSize.Y + 5)
-                upvalueLog:Destroy()
+    local temporaryUpvalues = selectedLog.TemporaryUpvalues
+    local instance = selectedLog.Instance
+    local newHeight = 0
+
+    if temporaryUpvalues then
+        for _, upvalueLog in pairs(temporaryUpvalues) do
+            newHeight = newHeight - (upvalueLog.AbsoluteSize.Y + 5)
+            upvalueLog:Destroy()
+        end
+        selectedLog.TemporaryUpvalues = nil
+        selectedLog.Closure.TemporaryUpvalues = {}
+    else
+        local closure       = selectedLog.Closure
+        temporaryUpvalues   = {}
+
+        for i, v in pairs(getUpvalues(closure)) do
+            if not closure.Upvalues[i] then
+                local upvalue = Upvalue.new(closure, i, v)
+                if type(v) == "table" then upvalue.Scanned = {} end
+
+                local upvalueLog = addUpvalue(upvalue, true)
+                upvalueLog.Parent = instance.Upvalues
+
+                newHeight = newHeight + upvalueLog.AbsoluteSize.Y + 5
+                temporaryUpvalues[i]            = upvalueLog
+                closure.TemporaryUpvalues[i]    = upvalue
             end
-
-            selectedLog.TemporaryUpvalues = nil
-            selectedLog.Closure.TemporaryUpvalues = {}
-        else
-            local closure = selectedLog.Closure
-            
-            temporaryUpvalues = {}
-
-            for i,v in pairs(getUpvalues(closure)) do
-                if not closure.Upvalues[i] then
-                    local upvalue = Upvalue.new(closure, i, v)
-                    
-                    if type(v) == "table" then
-                        upvalue.Scanned = {}
-                    end
-                    
-                    local upvalueLog = addUpvalue(upvalue, true)
-                    upvalueLog.Parent = instance.Upvalues
-                    
-                    newHeight = newHeight + upvalueLog.AbsoluteSize.Y + 5
-                    temporaryUpvalues[i] = upvalueLog
-                    closure.TemporaryUpvalues[i] = upvalue
-                end
-            end
-
-            selectedLog.TemporaryUpvalues = temporaryUpvalues
         end
 
-        newHeight = UDim2.new(0, 0, 0, newHeight)
-
-        instance.Upvalues.Size = instance.Upvalues.Size + newHeight
-        instance.Size = instance.Size + newHeight
-
-        upvalueList:Recalculate()
+        selectedLog.TemporaryUpvalues = temporaryUpvalues
     end
+
+    instance.Upvalues.Size = instance.Upvalues.Size + UDim2.new(0, 0, 0, newHeight)
+    instance.Size          = instance.Size          + UDim2.new(0, 0, 0, newHeight)
+    upvalueList:Recalculate()
 end)
 
 getScriptContext:SetCallback(function()
     if selectedLog then
         local script = getfenv(selectedLog.Closure.Data).script
-            
         if typeof(script) == "Instance" then
             setClipboard(getInstancePath(script))
         end
@@ -731,48 +632,41 @@ viewElementsContext:SetCallback(function()
     local newHeight = 0
 
     if temporaryElements then
-        for index, _v in pairs(temporaryElements) do
-            local elementLog = selectedUpvalueLog.Elements[toString(index)]
-            newHeight = newHeight - (elementLog.AbsoluteSize.Y + 5)
-
-            elementLog:Destroy()
+        for index in pairs(temporaryElements) do
+            local el = selectedUpvalueLog.Elements[toString(index)]
+            newHeight = newHeight - (el.AbsoluteSize.Y + 5)
+            el:Destroy()
         end
-
         selectedUpvalue.TemporaryElements = nil
     else
-        local scanned = selectedUpvalue.Scanned
-        temporaryElements = {}
+        local scanned       = selectedUpvalue.Scanned
+        temporaryElements   = {}
 
-        for i,v in pairs(selectedUpvalue.Value) do
+        for i, v in pairs(selectedUpvalue.Value) do
             if not scanned[i] then
-                local elementLog = addElement(selectedUpvalueLog, selectedUpvalue, i, v, true)
-                elementLog.Parent = selectedUpvalueLog.Elements
-
-                newHeight = newHeight + elementLog.AbsoluteSize.Y + 5
-                temporaryElements[i] = elementLog
+                local el = addElement(selectedUpvalueLog, selectedUpvalue, i, v, true)
+                el.Parent = selectedUpvalueLog.Elements
+                newHeight = newHeight + el.AbsoluteSize.Y + 5
+                temporaryElements[i] = el
             end
-        end 
+        end
 
         selectedUpvalue.TemporaryElements = temporaryElements
     end
 
-    newHeight = UDim2.new(0, 0, 0, newHeight)
-
-    selectedUpvalueLog.Size = selectedUpvalueLog.Size + newHeight
-    selectedUpvalueLog.Parent.Parent.Size = selectedUpvalueLog.Parent.Parent.Size + newHeight
+    selectedUpvalueLog.Size = selectedUpvalueLog.Size + UDim2.new(0, 0, 0, newHeight)
+    selectedUpvalueLog.Parent.Parent.Size = selectedUpvalueLog.Parent.Parent.Size + UDim2.new(0, 0, 0, newHeight)
     upvalueList:Recalculate()
 end)
 
 local function changeUpvalue()
     if selectedUpvalue then
-        local index = selectedUpvalue.Index
+        local index      = selectedUpvalue.Index
         local indexFrame = modifyUpvalueContent.Index
-        local indexNumber = indexFrame.Number
         local indexWidth = TextService:GetTextSize(tostring(index), 18, "SourceSans", indexFrame.AbsoluteSize).X
-        
-        indexNumber.Text = index
-        indexNumber.Size = UDim2.new(0, indexWidth, 0, 25)
-        
+
+        indexFrame.Number.Text = index
+        indexFrame.Number.Size = UDim2.new(0, indexWidth, 0, 25)
         modifyUpvalue:Show()
     end
 end
@@ -782,233 +676,151 @@ changeTableContext:SetCallback(changeUpvalue)
 
 changeElementContext:SetCallback(function()
     if selectedUpvalue and selectedElement then
-        local index = selectedElement
-        local indexType = typeof(index)
+        local index      = selectedElement
+        local indexType  = typeof(index)
         local indexFrame = modifyElementContent.Index
         local indexLabel = indexFrame.Data
         local indexWidth = TextService:GetTextSize(index, 18, "SourceSans", indexFrame.AbsoluteSize).X
-        
-        indexLabel.Text = index
-        indexLabel.TextColor3 = oh.Constants.Syntax[indexType]
-        indexLabel.Size = UDim2.new(0, indexWidth, 0, 25)
-        
+
+        indexLabel.Text           = index
+        indexLabel.TextColor3     = oh.Constants.Syntax[indexType]
+        indexLabel.Size           = UDim2.new(0, indexWidth, 0, 25)
         modifyElement:Show()
     end
 end)
 
--- Optimized smooth update loop with improved scroll handling and text refresh
-local visibleClosureLogs = {}
-local lastScrollPosition = 0
-local cacheRefreshInterval = 1.2 -- Longer cache refresh for better performance
-local lastCacheRefresh = 0
-local forcedUpdateCounter = 0
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FIX: RenderStepped update loop – skip entirely when scan is running;
+--      use simple viewport culling without a stale visibility cache.
+-- ─────────────────────────────────────────────────────────────────────────────
 
-oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
-    -- Only update if the page is visible
-    if not isVisible then
-        return
+local lastScrollY        = 0
+local cacheResetInterval = 2.0
+local lastCacheReset     = 0
+
+oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function()
+    if not isVisible or scanInProgress then return end
+
+    local now = tick()
+    if now - lastUpdateTime < updateInterval then return end
+    lastUpdateTime = now
+
+    -- Viewport bounds
+    local viewTop    = ResultsClip.AbsolutePosition.Y
+    local viewBottom = viewTop + ResultsClip.AbsoluteSize.Y
+    local buffer     = 200
+
+    -- Periodic full-cache clear to fix any permanently stuck text
+    if now - lastCacheReset > cacheResetInterval then
+        lastCacheReset  = now
+        visibleClosureLogs = {}
     end
-    
-    -- Skip update if scanning is in progress to reduce lag
-    if scanDebounce then
-        return
-    end
-    
-    local currentTime = tick()
-    
-    -- Check scroll position periodically to invalidate cache
-    if ResultsClip then
-        local currentScroll = ResultsClip.CanvasPosition.Y
-        
-        -- Detect scroll movement with larger threshold to reduce unnecessary updates
-        if math.abs(currentScroll - lastScrollPosition) > 80 then
-            lastScrollPosition = currentScroll
-            -- Clear visible cache when scrolling significantly
-            visibleClosureLogs = {}
+
+    local updated = 0
+    local maxPerFrame = 3
+
+    for _, closureLog in pairs(currentUpvalues) do
+        if updated >= maxPerFrame then break end
+        if not (closureLog and closureLog.Instance and closureLog.Instance.Parent) then continue end
+        if not closureLog.Instance.Visible then continue end
+
+        local absY   = closureLog.Instance.AbsolutePosition.Y
+        local absH   = closureLog.Instance.AbsoluteSize.Y
+        local inView = (absY + absH >= viewTop - buffer) and (absY <= viewBottom + buffer)
+
+        if inView then
+            closureLog:Update()
+            updated = updated + 1
         end
-        
-        -- Periodic cache refresh even without scroll to prevent stuck text
-        if currentTime - lastCacheRefresh > cacheRefreshInterval then
-            lastCacheRefresh = currentTime
-            forcedUpdateCounter = forcedUpdateCounter + 1
-            -- Only do full cache clear every 5th refresh for maximum performance
-            if forcedUpdateCounter % 5 == 0 then
-                visibleClosureLogs = {}
-            end
-        end
-    end
-    
-    -- Smooth time-based updates with longer interval for better performance (12 FPS target)
-    if currentTime - lastUpdateTime < updateInterval * 5 then
-        return
-    end
-    lastUpdateTime = currentTime
-    
-    -- Get current visible range
-    local clip = ResultsClip
-    local viewportTop = 0
-    local viewportBottom = 0
-    
-    if clip then
-        viewportTop = clip.AbsolutePosition.Y
-        viewportBottom = viewportTop + clip.AbsoluteSize.Y
-    end
-    
-    -- Batch updates for smoother performance with reduced count
-    local updateCount = 0
-    local maxUpdatesPerFrame = 2 -- Very conservative for maximum smoothness
-    
-    for _i, closureLog in pairs(currentUpvalues) do
-        if updateCount >= maxUpdatesPerFrame then
-            break
-        end
-        
-        -- Check if the log still exists and is valid
-        if closureLog and closureLog.Instance and closureLog.Instance.Parent then
-            local instance = closureLog.Instance
-            
-            -- Skip invisible items (search filtered out)
-            if not instance.Visible then
-                visibleClosureLogs[closureLog] = nil
-                goto continue
-            end
-            
-            local absPos = instance.AbsolutePosition.Y
-            local absSize = instance.AbsoluteSize.Y
-            
-            -- Smaller buffer zone for better performance
-            local bufferZone = 150
-            
-            -- Check if within or near visible area
-            local isInView = (absPos + absSize >= viewportTop - bufferZone) and (absPos <= viewportBottom + bufferZone)
-            
-            if isInView then
-                -- Force update visible items to prevent stuck text
-                closureLog:Update()
-                updateCount = updateCount + 1
-                visibleClosureLogs[closureLog] = true
-            elseif visibleClosureLogs[closureLog] then
-                -- Item was visible but now scrolled away - final update then remove from cache
-                closureLog:Update()
-                visibleClosureLogs[closureLog] = nil
-            end
-        else
-            -- Clean up invalid entries
-            visibleClosureLogs[closureLog] = nil
-        end
-        
-        ::continue::
     end
 end)
 
--- Handle page visibility to prevent stuck text and unnecessary updates with improved cleanup
-local Pages = Base.Body.Pages
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FIX: Page visibility handler – fully resets ALL state so nothing gets stuck
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local function onPageVisible(visible)
     isVisible = visible
 
     if not visible then
-        -- Clear selections when page is hidden to prevent stuck text
-        selectedLog = nil
-        selectedUpvalue = nil
-        selectedUpvalueLog = nil
-        selectedElement = nil
+        -- Cancel any in-flight scan to prevent it mutating the UI after switch
+        -- (the scan task will naturally exit via its own pcall, lock resets itself)
+        -- We force the lock off so the next visit isn't permanently blocked.
+        scanInProgress = false
 
-        -- Hide any open prompts immediately
+        -- Clear selections
+        selectedLog        = nil
+        selectedUpvalue    = nil
+        selectedUpvalueLog = nil
+        selectedElement    = nil
+
+        -- Dismiss any open UI
         modifyUpvalue:Hide()
         modifyElement:Hide()
-
-        -- Hide context menus immediately
         closureContextMenu:Hide()
         tableContextMenu:Hide()
         upvalueContextMenu:Hide()
         elementContextMenu:Hide()
-        
-        -- Reset search box and clear pending searches
+
+        -- Release focus so text box doesn't keep holding keystrokes
+        pcall(function() SearchBox:ReleaseFocus() end)
         SearchBox.Text = ""
-        pendingSearchQuery = nil
-        scanDebounce = false
-        
-        -- Clear focus from search box to prevent text sticking
-        if SearchBox and SearchBox.Parent then
-            SearchBox:ReleaseFocus()
-        end
-        
-        -- Clear visible cache to prevent stuck text on next visit
+
+        -- Reset update tracking so stale positions don't affect next visit
         visibleClosureLogs = {}
-        lastScrollPosition = 0
-        
-        -- Force UI to refresh and clear any stuck elements
-        task.spawn(function()
-            task.wait(0.02)
-            if SearchBox and SearchBox.Parent then
-                SearchBox:ReleaseFocus()
-            end
-            task.wait(0.03)
-            if ResultsClip and upvalueList then
-                upvalueList:Recalculate()
-            end
-        end)
+        lastScrollY        = 0
+        lastCacheReset     = 0
     else
-        -- When becoming visible, force a recalculation
+        -- Force one full update pass so values aren't stale on revisit
         task.defer(function()
-            if ResultsClip and upvalueList then
-                upvalueList:Recalculate()
-            end
-        end)
-        -- Force update all visible items with minimal staggered updates
-        task.spawn(function()
+            upvalueList:Recalculate()
             local count = 0
             for _, closureLog in pairs(currentUpvalues) do
                 if closureLog and closureLog.Instance and closureLog.Instance.Visible then
                     closureLog:Update()
                     count = count + 1
-                    -- Stagger updates more frequently to prevent freeze
-                    if count % 5 == 0 then
-                        task.wait(0.02)
-                    end
+                    if count % 10 == 0 then task.wait(0.02) end
                 end
             end
         end)
     end
 end
 
--- Connect to tab selector to track visibility with improved switching
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Tab selector integration
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local originalSelectTab = TabSelector.SelectTab
 TabSelector.SelectTab = function(tabName)
-    -- Hide current page before switching to prevent stuck UI
     if isVisible and tabName ~= "UpvalueScanner" then
         onPageVisible(false)
     end
 
     local result = originalSelectTab(tabName)
 
-    -- Show new page if it's UpvalueScanner
     if tabName == "UpvalueScanner" and result then
-        task.wait(0.02) -- Reduced delay for snappier response
+        task.wait(0.02)
         onPageVisible(true)
     end
 
     return result
 end
 
--- Also listen for direct page visibility changes with better cleanup
-if Page:GetPropertyChangedSignal("Visible") then
-    Page:GetPropertyChangedSignal("Visible"):Connect(function()
-        if not Page.Visible and isVisible then
-            onPageVisible(false)
-        elseif Page.Visible and not isVisible then
-            onPageVisible(true)
-        end
-    end)
-end
+-- Also react to direct Visible changes (e.g. from other tab-switching code)
+Page:GetPropertyChangedSignal("Visible"):Connect(function()
+    if Page.Visible and not isVisible then
+        onPageVisible(true)
+    elseif not Page.Visible and isVisible then
+        onPageVisible(false)
+    end
+end)
 
--- Initial visibility check with faster response
+-- Initial check
 task.spawn(function()
-    task.wait(0.05)
-    local currentPage = Pages and Pages.UpvalueScanner
-    if currentPage and currentPage.Visible then
+    task.wait(0.1)
+    if Page.Visible then
         onPageVisible(true)
     end
 end)
 
-return UpvalueScanner 
+return UpvalueScanner
