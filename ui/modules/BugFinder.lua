@@ -330,7 +330,7 @@ local function performScan(query)
                 deep = filterOptions.deepScan,
                 fuzzy = filterOptions.fuzzySearch,
                 categories = filterOptions.categories,
-                maxResults = 500
+                maxResults = 300 -- Reduced from 500 for better performance
             })
         end)
         
@@ -358,9 +358,9 @@ local function performScan(query)
         end
         
         -- Display results in batches to prevent freezing
-        local batchSize = 30
+        local batchSize = 20 -- Smaller batch size for smoother UI
         local displayedCount = 0
-        local totalDisplayed = math.min(totalBugs, 100) -- Limit display to prevent UI lag
+        local totalDisplayed = math.min(totalBugs, 80) -- Reduced from 100 to prevent UI lag
         
         for i, bugData in ipairs(results.results) do
             if displayedCount >= totalDisplayed then break end
@@ -368,9 +368,9 @@ local function performScan(query)
             createBugLog(bugData)
             displayedCount = displayedCount + 1
             
-            -- Yield periodically to prevent freezing
+            -- Yield more frequently to prevent freezing
             if displayedCount % batchSize == 0 then
-                task.wait(0.01)
+                task.wait(0.02)
             end
         end
         

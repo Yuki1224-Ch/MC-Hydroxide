@@ -39,13 +39,14 @@ local deepSearch = CheckBox.new(Filters.SearchInTables)
 local upvalueList = List.new(ResultsClip.Content)
 
 local deepSearchFlag = false
+local fastSearchFlag = true -- Fast mode enabled by default for better performance
 local currentUpvalues = {}
 local updateConnection = nil
 local isVisible = false
 local scanDebounce = false
 local pendingSearchQuery = nil
 local lastSearchTime = 0
-local searchCooldown = 0.25 -- Reduced cooldown for snappier search
+local searchCooldown = 0.15 -- Reduced cooldown for faster search
 
 local selectedLog
 local selectedUpvalue
@@ -103,8 +104,8 @@ end
 
 local function addElement(upvalueLog, upvalue, index, value, temporary)
     local elementLog = Assets.Element:Clone()
-    local elementIndexType = type(index)
-    local elementValueType = type(value)
+    local elementIndexType = typeof(index)
+    local elementValueType = typeof(value)
     local indexText = toString(index)
 
     if temporary then
@@ -114,7 +115,8 @@ local function addElement(upvalueLog, upvalue, index, value, temporary)
 
     elementLog.Name = indexText
     elementLog.Index.Label.Text = indexText
-    elementLog.Value.Label.Text = toString(value)
+    local success, valueText = pcall(toString, value)
+    elementLog.Value.Label.Text = success and valueText or "<error>"
     elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
     elementLog.Index.Icon.Image = oh.Constants.Types[elementIndexType]
     elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
@@ -155,8 +157,8 @@ end
 
 local function updateElement(upvalueLog, index, value)
     local indexText = toString(index)
-    local elementIndexType = type(index)
-    local elementValueType = type(value)
+    local elementIndexType = typeof(index)
+    local elementValueType = typeof(value)
     local elementLog = upvalueLog.Elements:FindFirstChild(indexText)
     
     -- Skip if element UI no longer exists
@@ -165,8 +167,8 @@ local function updateElement(upvalueLog, index, value)
     end
 
     -- Force complete refresh with safe text setting to prevent stuck state
-    local newValueText = toString(value)
-    setTextSafely(elementLog.Value.Label, newValueText)
+    local success, newValueText = pcall(toString, value)
+    setTextSafely(elementLog.Value.Label, success and newValueText or "<error>")
     elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
     elementLog.Value.Icon.Image = oh.Constants.Types[elementValueType]
     
@@ -179,7 +181,7 @@ local function addUpvalue(upvalue, temporary)
     local upvalueLog
     local index = upvalue.Index
     local value = upvalue.Value
-    local valueType = type(value)
+    local valueType = typeof(value)
     
     if valueType == "table" then
         upvalueLog = Assets.Table:Clone()
@@ -212,7 +214,8 @@ local function addUpvalue(upvalue, temporary)
             local closureName = getInfo(value).name or ''
             upvalueLog.Value.Text = (closureName == '' and "Unnamed function") or closureName
         else
-            upvalueLog.Value.Text = toString(value)
+            local success, valueText = pcall(toString, value)
+            upvalueLog.Value.Text = success and valueText or "<error>"
         end
     end
     
@@ -261,7 +264,7 @@ local function updateUpvalue(closureLog, upvalue)
     local closure = upvalue.Closure
     local index = upvalue.Index
     local newValue = getUpvalue(closure, index)
-    local valueType = type(newValue)
+    local valueType = typeof(newValue)
 
     -- Safe text update with clearing to prevent stuck text
     if valueType == "function" then
@@ -281,8 +284,12 @@ local function updateUpvalue(closureLog, upvalue)
             end
         end
     else
-        local newValueText = toString(newValue)
-        setTextSafely(upvalueLog.Value, newValueText)
+        local success, newValueText = pcall(toString, newValue)
+        if success then
+            setTextSafely(upvalueLog.Value, newValueText)
+        else
+            setTextSafely(upvalueLog.Value, "<error>")
+        end
     end
 
     upvalueLog.Value.TextColor3 = oh.Constants.Syntax[valueType]
@@ -376,8 +383,8 @@ local function addUpvalues()
         local showResultLabel = false
         local totalResults = 0
 
-        -- Use debounce to prevent lag during search
-        local scanResults = Methods.Scan(query, deepSearchFlag)
+        -- Use debounce to prevent lag during search with result limit
+        local scanResults = Methods.Scan(query, deepSearchFlag, 300, not fastSearchFlag) -- Limit to 300 results max, fast mode skips deep nesting
         
         -- Convert to array for controlled iteration
         local resultsArray = {}
@@ -404,7 +411,7 @@ local function addUpvalues()
         
         -- Process results in batches to prevent freezing
         local processed = 0
-        local batchSize = 30 -- Increased batch size for faster display
+        local batchSize = 20 -- Smaller batch size for smoother UI
         
         while processed < resultCount do
             local batchEnd = math.min(processed + batchSize, resultCount)
@@ -432,7 +439,7 @@ local function addUpvalues()
             
             -- Yield to prevent freezing if more results to process
             if processed < resultCount then
-                task.wait(0.01)
+                task.wait(0.015) -- Slightly longer yield for better responsiveness
             end
         end
 
@@ -467,6 +474,9 @@ deepSearch:SetCallback(function(enabled)
         MessageBox.Show("Notice", "Deep searching may result in longer scan times!", MessageType.OK)
     end
 end)
+
+-- Fast mode is always enabled by default for better performance
+-- Deep search will still work but nested table scanning is skipped in fast mode
 
 -- Optimized search trigger with debounce
 local function triggerSearch()
@@ -775,7 +785,7 @@ changeTableContext:SetCallback(changeUpvalue)
 changeElementContext:SetCallback(function()
     if selectedUpvalue and selectedElement then
         local index = selectedElement
-        local indexType = type(index)
+        local indexType = typeof(index)
         local indexFrame = modifyElementContent.Index
         local indexLabel = indexFrame.Data
         local indexWidth = TextService:GetTextSize(index, 18, "SourceSans", indexFrame.AbsoluteSize).X
@@ -791,9 +801,9 @@ end)
 -- Optimized smooth update loop with improved scroll handling and text refresh
 local visibleClosureLogs = {}
 local lastScrollPosition = 0
-local scrollCheckInterval = 0.05
+local scrollCheckInterval = 0.1 -- Reduced frequency for better performance
 local lastScrollCheck = 0
-local cacheRefreshInterval = 0.2
+local cacheRefreshInterval = 0.5 -- Longer cache refresh interval
 local lastCacheRefresh = 0
 
 oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
@@ -813,8 +823,8 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
     if ResultsClip then
         local currentScroll = ResultsClip.CanvasPosition.Y
         
-        -- Detect scroll movement
-        if math.abs(currentScroll - lastScrollPosition) > 1 then
+        -- Detect scroll movement with larger threshold
+        if math.abs(currentScroll - lastScrollPosition) > 5 then
             lastScrollPosition = currentScroll
             lastScrollCheck = currentTime
             -- Clear visible cache when scrolling to force fresh updates
@@ -828,8 +838,8 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
         end
     end
     
-    -- Smooth time-based updates
-    if currentTime - lastUpdateTime < updateInterval then
+    -- Smooth time-based updates with longer interval for better performance
+    if currentTime - lastUpdateTime < updateInterval * 2 then -- 30 FPS target instead of 60
         return
     end
     lastUpdateTime = currentTime
@@ -844,9 +854,9 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
         viewportBottom = viewportTop + clip.AbsoluteSize.Y
     end
     
-    -- Batch updates for smoother performance
+    -- Batch updates for smoother performance with reduced count
     local updateCount = 0
-    local maxUpdatesPerFrame = 8
+    local maxUpdatesPerFrame = 5 -- Reduced from 8 for better performance
     
     for _i, closureLog in pairs(currentUpvalues) do
         if updateCount >= maxUpdatesPerFrame then
@@ -866,8 +876,8 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
             local absPos = instance.AbsolutePosition.Y
             local absSize = instance.AbsoluteSize.Y
             
-            -- Buffer zone for preloading
-            local bufferZone = 250
+            -- Larger buffer zone for better preloading
+            local bufferZone = 400
             
             -- Check if within or near visible area
             local isInView = (absPos + absSize >= viewportTop - bufferZone) and (absPos <= viewportBottom + bufferZone)

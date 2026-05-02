@@ -1,75 +1,52 @@
 ```
-# Lua-specific
-*.luac
-?.lua.1
-?_lua.1
+# Compiled and build artifacts
+*.pyc
+__pycache__/
 
 # Dependencies
-?.deps
-.deps
-
-# Build artifacts
-build/
-dist/
-*.so
-*.dll
-*.dylib
+.venv/
+venv/
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
 
-# Editors
-.vscode/
-.idea/
-
 # Environment
 .env
 .env.local
 *.env.*
 
-# Coverage
-.coverage
+# Editors
+.vscode/
+.idea/
+
+# Coverage reports
 coverage/
 htmlcov/
+.coverage
 
-# Python (if mixed project)
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.venv/
-venv/
-.Python
-pip-log.txt
-pip-delete-this-directory.txt
+# MyPy cache
+.mypy_cache/
 
-# Node (if mixed project)
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# Pytest cache
+.pytest_cache/
 
-# Java (if mixed project)
-*.class
-*.jar
-*.war
-*.ear
-target/
-.gradle/
+# Distribution / packaging
+dist/
 build/
+*.egg-info/
 
-# C/C++ (if mixed project)
-*.o
-*.a
-*.obj
-*.out
-*.exe
-*.dll
-*.so
+# OS generated files
+.DS_Store
+Thumbs.db
 
-# Compression
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Compressed files
 *.zip
 *.gz
 *.tar
@@ -92,8 +69,4 @@ build/
 *.tar.bz2
 *.tar.xz
 *.tar.zst
-
-# System
-.DS_Store
-Thumbs.db
 ```
