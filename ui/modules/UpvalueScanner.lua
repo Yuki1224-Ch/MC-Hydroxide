@@ -44,8 +44,6 @@ local currentUpvalues = {}
 local updateConnection = nil
 local isVisible = false
 
--- FIX: Single atomic scan lock – set true before scanning, false in a
--- finally-style pcall wrapper so it ALWAYS gets cleared.
 local scanInProgress = false
 
 local selectedLog
@@ -54,7 +52,7 @@ local selectedUpvalueLog
 local selectedElement
 
 local lastUpdateTime = 0
-local updateInterval = 1 / 20 -- 20 FPS for value polling (plenty smooth)
+local updateInterval = 1 / 20
 local visibleClosureLogs = {}
 
 local spyClosureContext    = ContextMenuButton.new("rbxassetid://4666593447", "Spy Closure")
@@ -93,6 +91,32 @@ local constants = {
     tempUpvalueColor  = Color3.fromRGB(40, 20, 20),
     tempBorderColor   = Color3.fromRGB(20, 0, 0),
 }
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FIX: Hard clear – destroys ALL cloned log instances and resets tracking table.
+-- This is the primary fix for the "floating text on screen" bug: previously
+-- logs were only hidden (Visible = false) but their instances stayed parented
+-- to the ScrollingFrame and could escape clipping under certain conditions.
+-- Now we fully destroy them so they cannot appear anywhere.
+-- ─────────────────────────────────────────────────────────────────────────────
+local function clearAllLogs()
+    -- Destroy every cloned instance still in the list
+    for _, log in pairs(currentUpvalues) do
+        if log and log.Instance then
+            pcall(function() log.Instance:Destroy() end)
+        end
+    end
+    -- Wipe the tracking table so no stale references remain
+    currentUpvalues = {}
+    -- Reset the List control's canvas so height is correct
+    upvalueList:Clear()
+    -- Clear selections that pointed at now-destroyed objects
+    selectedLog        = nil
+    selectedUpvalue    = nil
+    selectedUpvalueLog = nil
+    selectedElement    = nil
+    visibleClosureLogs = {}
+end
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Helpers
@@ -188,10 +212,10 @@ local function addUpvalue(upvalue, temporary)
         end
     end
 
-    upvalueLog.Name            = index
-    upvalueLog.Index.Text      = index
+    upvalueLog.Name             = index
+    upvalueLog.Index.Text       = index
     upvalueLog.Value.TextColor3 = oh.Constants.Syntax[valueType]
-    upvalueLog.Icon.Image      = oh.Constants.Types[valueType]
+    upvalueLog.Icon.Image       = oh.Constants.Types[valueType]
 
     local function showUpvalueContext()
         selectedUpvalue    = upvalue
@@ -218,9 +242,9 @@ local function updateUpvalue(closureLog, upvalue)
     local upvalueLog = closureLog.Instance.Upvalues[tostring(upvalue.Index)]
     if not upvalueLog then return end
 
-    local closure  = upvalue.Closure
-    local index    = upvalue.Index
-    local newValue = getUpvalue(closure, index)
+    local closure   = upvalue.Closure
+    local index     = upvalue.Index
+    local newValue  = getUpvalue(closure, index)
     local valueType = typeof(newValue)
 
     if valueType == "function" then
@@ -257,10 +281,13 @@ end
 local Log = {}
 
 function Log.new(closure)
-    local log       = {}
-    local instance  = Assets.ClosureLog:Clone()
+    local log        = {}
+    -- FIX: Instance is created and parented via ListButton.new → list's
+    -- ScrollingFrame, which has ClipsDescendants = true. We never parent
+    -- instances anywhere else, so they cannot appear floating in the world.
+    local instance   = Assets.ClosureLog:Clone()
     local listButton = ListButton.new(instance, upvalueList)
-    local logHeight = 30
+    local logHeight  = 30
 
     log.Instance = instance
     log.Closure  = closure
@@ -302,15 +329,15 @@ function Log.update(log)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- FIX: addUpvalues – proper lock/unlock with pcall so it NEVER stays locked
+-- FIX: addUpvalues – ALWAYS destroy old logs before creating new ones.
+-- The previous code only hid them; hidden instances can still escape clipping
+-- when the parent ScrollingFrame is repositioned or the panel is toggled.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local function addUpvalues()
-    -- Guard: only one scan at a time
     if scanInProgress then return end
 
     local query = SearchBox.Text
-    -- FIX: clear the box immediately so it doesn't flicker later
     SearchBox.Text = ""
 
     if query:gsub("%s", "") == "" then
@@ -326,53 +353,36 @@ local function addUpvalues()
     scanInProgress = true
     oh.setStatus("Scanning upvalues…")
 
-    -- Run in a coroutine so yields work, but wrap everything in pcall so the
-    -- lock is ALWAYS released even on error.
+    -- FIX: Destroy all existing log instances BEFORE the scan so there is
+    -- zero chance of stale UI elements being visible during or after the scan.
+    clearAllLogs()
+
     task.spawn(function()
         local ok, err = pcall(function()
             local scanResults = Methods.Scan(query, deepSearchFlag, 300, not deepSearchFlag)
 
-            -- Build array for controlled iteration
             local resultsArray = {}
             for _, closure in pairs(scanResults) do
                 table.insert(resultsArray, closure)
             end
 
-            local resultCount = #resultsArray
-
-            -- Hide all existing logs (filter approach – avoids destroy/recreate)
-            for _, log in pairs(currentUpvalues) do
-                if log.Instance and log.Instance.Parent then
-                    log.Instance.Visible = false
-                end
-            end
-
-            -- Process in small batches so the UI stays responsive
             local totalShown = 0
             local batchSize  = 8
 
-            for i = 1, resultCount do
-                local closure    = resultsArray[i]
-                local closureData = closure.Data
-                local existing   = currentUpvalues[closureData]
-
-                if existing then
-                    existing.Instance.Visible = true
-                    existing:Update()
-                else
-                    Log.new(closure)
-                end
-
+            for i = 1, #resultsArray do
+                local closure = resultsArray[i]
+                -- FIX: Never reuse stale log entries; always create fresh ones.
+                -- currentUpvalues was fully cleared above so this always creates new.
+                Log.new(closure)
                 totalShown = totalShown + 1
 
-                -- Yield every batchSize items
                 if i % batchSize == 0 then
                     task.wait(0.04)
                 end
             end
 
-            ResultStatus.Visible      = (totalShown > 0)
-            ResultStatus.Label.Text   = string.format(
+            ResultStatus.Visible    = (totalShown > 0)
+            ResultStatus.Label.Text = string.format(
                 "Found %d result%s", totalShown, totalShown ~= 1 and "s" or "")
 
             upvalueList:Recalculate()
@@ -385,7 +395,6 @@ local function addUpvalues()
             end
         end)
 
-        -- FIX: ALWAYS unlock, whether scan succeeded or errored
         scanInProgress = false
 
         if not ok then
@@ -396,7 +405,7 @@ local function addUpvalues()
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Context menus / bindings (unchanged logic, just wired up)
+-- Context menus / bindings
 -- ─────────────────────────────────────────────────────────────────────────────
 
 upvalueList:BindContextMenu(closureContextMenu)
@@ -523,9 +532,9 @@ local value   = YOUR_NEW_VALUE_HERE
 end
 
 local function generateScript(elementIndex)
-    local index       = selectedUpvalue.Index
-    local closure     = selectedUpvalue.Closure
-    local closureData = closure.Data
+    local index        = selectedUpvalue.Index
+    local closure      = selectedUpvalue.Closure
+    local closureData  = closure.Data
     local closureScript = rawget(getfenv(closureData), "script")
 
     local generated = generateScriptFormat(dataToString(elementIndex))
@@ -593,8 +602,8 @@ viewUpvaluesContext:SetCallback(function()
         selectedLog.TemporaryUpvalues = nil
         selectedLog.Closure.TemporaryUpvalues = {}
     else
-        local closure       = selectedLog.Closure
-        temporaryUpvalues   = {}
+        local closure     = selectedLog.Closure
+        temporaryUpvalues = {}
 
         for i, v in pairs(getUpvalues(closure)) do
             if not closure.Upvalues[i] then
@@ -605,8 +614,8 @@ viewUpvaluesContext:SetCallback(function()
                 upvalueLog.Parent = instance.Upvalues
 
                 newHeight = newHeight + upvalueLog.AbsoluteSize.Y + 5
-                temporaryUpvalues[i]            = upvalueLog
-                closure.TemporaryUpvalues[i]    = upvalue
+                temporaryUpvalues[i]         = upvalueLog
+                closure.TemporaryUpvalues[i] = upvalue
             end
         end
 
@@ -639,8 +648,8 @@ viewElementsContext:SetCallback(function()
         end
         selectedUpvalue.TemporaryElements = nil
     else
-        local scanned       = selectedUpvalue.Scanned
-        temporaryElements   = {}
+        local scanned     = selectedUpvalue.Scanned
+        temporaryElements = {}
 
         for i, v in pairs(selectedUpvalue.Value) do
             if not scanned[i] then
@@ -682,16 +691,15 @@ changeElementContext:SetCallback(function()
         local indexLabel = indexFrame.Data
         local indexWidth = TextService:GetTextSize(index, 18, "SourceSans", indexFrame.AbsoluteSize).X
 
-        indexLabel.Text           = index
-        indexLabel.TextColor3     = oh.Constants.Syntax[indexType]
-        indexLabel.Size           = UDim2.new(0, indexWidth, 0, 25)
+        indexLabel.Text       = index
+        indexLabel.TextColor3 = oh.Constants.Syntax[indexType]
+        indexLabel.Size       = UDim2.new(0, indexWidth, 0, 25)
         modifyElement:Show()
     end
 end)
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- FIX: RenderStepped update loop – skip entirely when scan is running;
---      use simple viewport culling without a stale visibility cache.
+-- RenderStepped update loop
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local lastScrollY        = 0
@@ -705,18 +713,16 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function()
     if now - lastUpdateTime < updateInterval then return end
     lastUpdateTime = now
 
-    -- Viewport bounds
     local viewTop    = ResultsClip.AbsolutePosition.Y
     local viewBottom = viewTop + ResultsClip.AbsoluteSize.Y
     local buffer     = 200
 
-    -- Periodic full-cache clear to fix any permanently stuck text
     if now - lastCacheReset > cacheResetInterval then
-        lastCacheReset  = now
+        lastCacheReset     = now
         visibleClosureLogs = {}
     end
 
-    local updated = 0
+    local updated    = 0
     local maxPerFrame = 3
 
     for _, closureLog in pairs(currentUpvalues) do
@@ -736,25 +742,25 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function()
 end)
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- FIX: Page visibility handler – fully resets ALL state so nothing gets stuck
+-- Page visibility handler
+-- FIX: On hide, call clearAllLogs() to destroy all instances so nothing can
+-- float over the game world when the panel is collapsed or tab is switched.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local function onPageVisible(visible)
     isVisible = visible
 
     if not visible then
-        -- Cancel any in-flight scan to prevent it mutating the UI after switch
-        -- (the scan task will naturally exit via its own pcall, lock resets itself)
-        -- We force the lock off so the next visit isn't permanently blocked.
+        -- Release scan lock so next visit isn't permanently blocked
         scanInProgress = false
 
-        -- Clear selections
-        selectedLog        = nil
-        selectedUpvalue    = nil
-        selectedUpvalueLog = nil
-        selectedElement    = nil
+        -- FIX: Fully destroy all log instances on hide.
+        -- This is the definitive fix for upvalue names/values appearing as
+        -- floating text over the game world when the Hydroxide panel is closed
+        -- or when the user switches tabs.
+        clearAllLogs()
 
-        -- Dismiss any open UI
+        -- Dismiss any open prompts / menus
         modifyUpvalue:Hide()
         modifyElement:Hide()
         closureContextMenu:Hide()
@@ -762,26 +768,19 @@ local function onPageVisible(visible)
         upvalueContextMenu:Hide()
         elementContextMenu:Hide()
 
-        -- Release focus so text box doesn't keep holding keystrokes
         pcall(function() SearchBox:ReleaseFocus() end)
         SearchBox.Text = ""
 
-        -- Reset update tracking so stale positions don't affect next visit
         visibleClosureLogs = {}
         lastScrollY        = 0
         lastCacheReset     = 0
+
+        -- Hide status row
+        ResultStatus.Visible = false
     else
-        -- Force one full update pass so values aren't stale on revisit
+        -- Force recalculate on revisit (currentUpvalues is empty after clearAllLogs)
         task.defer(function()
             upvalueList:Recalculate()
-            local count = 0
-            for _, closureLog in pairs(currentUpvalues) do
-                if closureLog and closureLog.Instance and closureLog.Instance.Visible then
-                    closureLog:Update()
-                    count = count + 1
-                    if count % 10 == 0 then task.wait(0.02) end
-                end
-            end
         end)
     end
 end
@@ -806,7 +805,6 @@ TabSelector.SelectTab = function(tabName)
     return result
 end
 
--- Also react to direct Visible changes (e.g. from other tab-switching code)
 Page:GetPropertyChangedSignal("Visible"):Connect(function()
     if Page.Visible and not isVisible then
         onPageVisible(true)
@@ -815,7 +813,6 @@ Page:GetPropertyChangedSignal("Visible"):Connect(function()
     end
 end)
 
--- Initial check
 task.spawn(function()
     task.wait(0.1)
     if Page.Visible then
