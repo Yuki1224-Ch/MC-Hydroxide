@@ -144,14 +144,14 @@ local function addElement(upvalueLog, upvalue, index, value, temporary)
 end
 
 local function setTextSafely(label, newText)
-    -- Clear text first to force refresh, then set new value
+    -- Force immediate refresh to prevent stuck text without yielding
     if label and label.Parent then
-        label.Text = ""
-        task.defer(function()
-            if label and label.Parent then
-                label.Text = newText
-            end
-        end)
+        local textStr = tostring(newText)
+        -- Only update if text actually changed to reduce unnecessary operations
+        if label.Text ~= textStr then
+            label.Text = ""
+            label.Text = textStr
+        end
     end
 end
 
@@ -175,6 +175,22 @@ local function updateElement(upvalueLog, index, value)
     setTextSafely(elementLog.Index.Label, indexText)
     elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
     elementLog.Index.Icon.Image = oh.Constants.Types[elementIndexType]
+end
+
+-- Optimized update function that only updates visible elements with minimal operations
+local function updateElementFast(upvalueLog, index, value)
+    local indexText = toString(index)
+    local elementLog = upvalueLog.Elements:FindFirstChild(indexText)
+    
+    if not elementLog then
+        return
+    end
+
+    -- Only update value text if changed, skip type icons for maximum performance
+    local success, newValueText = pcall(toString, value)
+    if success and elementLog.Value.Label.Text ~= newValueText then
+        elementLog.Value.Label.Text = newValueText
+    end
 end
 
 local function addUpvalue(upvalue, temporary)
@@ -273,14 +289,14 @@ local function updateUpvalue(closureLog, upvalue)
         setTextSafely(upvalueLog.Value, newValueText)
     elseif valueType == "table" and upvalue.Scanned then
         for i, v in pairs(upvalue.Scanned) do
-            updateElement(upvalueLog, i, v)
+            updateElementFast(upvalueLog, i, v) -- Use fast update for better performance
         end
 
         if upvalue.TemporaryElements then
             local table = upvalue.Value
 
             for idx, _v in pairs(upvalue.TemporaryElements) do
-                updateElement(upvalueLog, idx, table[idx])
+                updateElementFast(upvalueLog, idx, table[idx]) -- Use fast update
             end
         end
     else
@@ -340,8 +356,10 @@ function Log.update(log)
     
     -- Update closure name with safe text setting to prevent stuck text
     local nameLabel = log.Instance:FindFirstChild("Name")
-    if nameLabel then
-        setTextSafely(nameLabel, log.Closure.Name or "")
+    if nameLabel and log.Closure.Name then
+        if nameLabel.Text ~= log.Closure.Name then
+            setTextSafely(nameLabel, log.Closure.Name)
+        end
     end
     
     for _i, upvalue in pairs(log.Closure.Upvalues) do
@@ -409,9 +427,9 @@ local function addUpvalues()
             end
         end
         
-        -- Process results in batches to prevent freezing
+        -- Process results in batches to prevent freezing with optimized batch size
         local processed = 0
-        local batchSize = 20 -- Smaller batch size for smoother UI
+        local batchSize = 15 -- Smaller batch size for smoother UI response
         
         while processed < resultCount do
             local batchEnd = math.min(processed + batchSize, resultCount)
@@ -439,7 +457,7 @@ local function addUpvalues()
             
             -- Yield to prevent freezing if more results to process
             if processed < resultCount then
-                task.wait(0.015) -- Slightly longer yield for better responsiveness
+                task.wait(0.02) -- Slightly longer yield for better responsiveness
             end
         end
 
@@ -801,10 +819,11 @@ end)
 -- Optimized smooth update loop with improved scroll handling and text refresh
 local visibleClosureLogs = {}
 local lastScrollPosition = 0
-local scrollCheckInterval = 0.1 -- Reduced frequency for better performance
+local scrollCheckInterval = 0.15 -- Reduced frequency for better performance
 local lastScrollCheck = 0
-local cacheRefreshInterval = 0.5 -- Longer cache refresh interval
+local cacheRefreshInterval = 0.8 -- Longer cache refresh interval for better performance
 local lastCacheRefresh = 0
+local forcedUpdateCounter = 0
 
 oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
     -- Only update if the page is visible
@@ -823,8 +842,8 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
     if ResultsClip then
         local currentScroll = ResultsClip.CanvasPosition.Y
         
-        -- Detect scroll movement with larger threshold
-        if math.abs(currentScroll - lastScrollPosition) > 5 then
+        -- Detect scroll movement with larger threshold to reduce unnecessary updates
+        if math.abs(currentScroll - lastScrollPosition) > 10 then
             lastScrollPosition = currentScroll
             lastScrollCheck = currentTime
             -- Clear visible cache when scrolling to force fresh updates
@@ -834,12 +853,16 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
         -- Periodic cache refresh even without scroll to prevent stuck text
         if currentTime - lastCacheRefresh > cacheRefreshInterval then
             lastCacheRefresh = currentTime
-            visibleClosureLogs = {}
+            forcedUpdateCounter = forcedUpdateCounter + 1
+            -- Only do full cache clear every 3rd refresh to balance performance and freshness
+            if forcedUpdateCounter % 3 == 0 then
+                visibleClosureLogs = {}
+            end
         end
     end
     
-    -- Smooth time-based updates with longer interval for better performance
-    if currentTime - lastUpdateTime < updateInterval * 2 then -- 30 FPS target instead of 60
+    -- Smooth time-based updates with longer interval for better performance (20 FPS target)
+    if currentTime - lastUpdateTime < updateInterval * 3 then
         return
     end
     lastUpdateTime = currentTime
@@ -856,7 +879,7 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
     
     -- Batch updates for smoother performance with reduced count
     local updateCount = 0
-    local maxUpdatesPerFrame = 5 -- Reduced from 8 for better performance
+    local maxUpdatesPerFrame = 4 -- Reduced from 5 for better performance
     
     for _i, closureLog in pairs(currentUpvalues) do
         if updateCount >= maxUpdatesPerFrame then
@@ -876,8 +899,8 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
             local absPos = instance.AbsolutePosition.Y
             local absSize = instance.AbsoluteSize.Y
             
-            -- Larger buffer zone for better preloading
-            local bufferZone = 400
+            -- Larger buffer zone for better preloading but not too large
+            local bufferZone = 300
             
             -- Check if within or near visible area
             local isInView = (absPos + absSize >= viewportTop - bufferZone) and (absPos <= viewportBottom + bufferZone)
@@ -901,7 +924,7 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function(deltaTime)
     end
 end)
 
--- Handle page visibility to prevent stuck text and unnecessary updates
+-- Handle page visibility to prevent stuck text and unnecessary updates with improved cleanup
 local Pages = Base.Body.Pages
 local function onPageVisible(visible)
     isVisible = visible
@@ -937,13 +960,19 @@ local function onPageVisible(visible)
         visibleClosureLogs = {}
         lastScrollPosition = 0
         
-        -- Force UI to refresh and clear any stuck elements with multiple cleanup passes
+        -- Force UI to refresh and clear any stuck elements with immediate cleanup
         task.spawn(function()
-            for i = 1, 3 do
-                task.wait(0.02)
+            -- Multiple quick cleanup passes
+            for i = 1, 5 do
+                task.wait(0.01)
                 if SearchBox and SearchBox.Parent then
                     SearchBox:ReleaseFocus()
                 end
+            end
+            -- Final force refresh
+            task.wait(0.05)
+            if ResultsClip and upvalueList then
+                upvalueList:Recalculate()
             end
         end)
     else
@@ -953,11 +982,17 @@ local function onPageVisible(visible)
                 upvalueList:Recalculate()
             end
         end)
-        -- Force update all visible items immediately
-        task.defer(function()
+        -- Force update all visible items immediately with staggered updates
+        task.spawn(function()
+            local count = 0
             for _, closureLog in pairs(currentUpvalues) do
                 if closureLog and closureLog.Instance and closureLog.Instance.Visible then
                     closureLog:Update()
+                    count = count + 1
+                    -- Stagger updates to prevent freeze
+                    if count % 10 == 0 then
+                        task.wait(0.01)
+                    end
                 end
             end
         end)

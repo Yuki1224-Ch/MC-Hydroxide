@@ -1,16 +1,21 @@
 ```
-# Compiled and build artifacts
-*.pyc
-__pycache__/
+# Lua-specific
+*.luac
+?.lua
 
 # Dependencies
-.venv/
-venv/
+?.rockspec
+?/.deps
 
-# Logs and temp files
+# Build artifacts
+build/
+dist/
+?.so
+?.dll
+?.dylib
+
+# Logs
 *.log
-*.tmp
-*.swp
 
 # Environment
 .env
@@ -20,31 +25,54 @@ venv/
 # Editors
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Coverage reports
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
 coverage/
 htmlcov/
 .coverage
 
-# MyPy cache
+# Python (if used in project)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
 .mypy_cache/
 
-# Pytest cache
-.pytest_cache/
+# Node (if used in project)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
+# Java/Gradle (if used in project)
+target/
+.gradle/
+*.class
+*.jar
+*.war
+*.ear
 
-# OS generated files
-.DS_Store
-Thumbs.db
-
-# Temporary files
-*.tmp
-*.temp
-*.bak
+# C/C++ (if used in project)
+*.o
+*.a
+*.obj
+*.out
+*.exe
+*.dll
+*.so
 
 # Compressed files
 *.zip
