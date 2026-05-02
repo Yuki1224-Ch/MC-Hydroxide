@@ -1,10 +1,33 @@
-local RunService = game:GetService("RunService")
-local TextService = game:GetService("TextService")
+--[[
+    ui/modules/UpvalueScanner.lua  –  FULLY FIXED VERSION
+    -------------------------------------------------------
+    Root-cause fixes applied:
+      1. ALL cloned Roblox instances are now created inside a dedicated
+         ScreenGui that is parented to CoreGui (or getHui()).  This means
+         they are ALWAYS behind the ClipsDescendants containers and can
+         NEVER appear as floating world-space text.
+      2. clearAllLogs() now calls :Destroy() on every cloned instance and
+         resets every tracking table, so no stale references survive.
+      3. scanInProgress is always released in a `finally`-style pcall
+         wrapper, so the UI can never get permanently stuck.
+      4. The RenderStepped update loop is fully suspended while the panel
+         is invisible and during an active scan.
+      5. Every context-menu / prompt is hidden on panel-close.
+      6. Tab-switch now properly destroys logs from the OLD tab before
+         showing the NEW one.
+      7. addUpvalues() clears logs BEFORE spawning the scan task, so old
+         text cannot stay visible while the new scan runs.
+      8. ResultStatus is always hidden before a new scan starts.
+]]
+
+local RunService   = game:GetService("RunService")
+local TextService  = game:GetService("TextService")
 local TweenService = game:GetService("TweenService")
+local CoreGui      = game:GetService("CoreGui")
 
 local UpvalueScanner = {}
-local ClosureSpy = import("modules/ClosureSpy")
-local Methods = import("modules/UpvalueScanner")
+local ClosureSpy     = import("modules/ClosureSpy")
+local Methods        = import("modules/UpvalueScanner")
 
 if not hasMethods(Methods.RequiredMethods) then
     return UpvalueScanner
@@ -12,48 +35,66 @@ end
 
 local Upvalue = import("objects/Upvalue")
 
-local Prompt = import("ui/controls/Prompt")
-local CheckBox = import("ui/controls/CheckBox")
-local Dropdown = import("ui/controls/Dropdown")
-local List, ListButton = import("ui/controls/List")
-local TabSelector = import("ui/controls/TabSelector")
+local Prompt,   _         = import("ui/controls/Prompt"),   nil
+local CheckBox            = import("ui/controls/CheckBox")
+local Dropdown            = import("ui/controls/Dropdown")
+local List, ListButton    = import("ui/controls/List")
+local TabSelector         = import("ui/controls/TabSelector")
 local MessageBox, MessageType = import("ui/controls/MessageBox")
 local ContextMenu, ContextMenuButton = import("ui/controls/ContextMenu")
 
-local Base = import("rbxassetid://11389137937").Base
+local Base   = import("rbxassetid://11389137937").Base
 local Assets = import("rbxassetid://5042114982").UpvalueScanner
 
-local Prompts = Base.Prompts
-local Page = Base.Body.Pages.UpvalueScanner
+local Prompts     = Base.Prompts
+local Page        = Base.Body.Pages.UpvalueScanner
 
-local Query = Page.Query
-local Search = Query.Search
-local SearchBox = Query.Query
-local Filters = Page.Filters
-local ResultsClip = Page.Results.Clip
+local Query        = Page.Query
+local Search       = Query.Search
+local SearchBox    = Query.Query
+local Filters      = Page.Filters
+local ResultsClip  = Page.Results.Clip
 local ResultStatus = ResultsClip.ResultStatus
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FIX 1: Safe container – all cloned instances go inside a dedicated
+--         ScreenGui that is parented to CoreGui.  They can NEVER escape
+--         this container and appear as floating world text.
+-- ─────────────────────────────────────────────────────────────────────────────
+local safeContainer
+do
+    local sg = Instance.new("ScreenGui")
+    sg.Name            = "OHUpvalueContainer_" .. tostring(math.random(1e8))
+    sg.ResetOnSpawn    = false
+    sg.IgnoreGuiInset  = true
+    sg.Enabled         = false          -- invisible; only used as a parent sink
+    sg.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+    pcall(function()
+        sg.Parent = (getHui and getHui()) or CoreGui
+    end)
+    if not sg.Parent then
+        sg.Parent = CoreGui
+    end
+    safeContainer = sg
+end
 
 local modifyUpvalue = Prompt.new(Prompts.ModifyUpvalue)
 local modifyElement = Prompt.new(Prompts.ModifyElement)
-local deepSearch = CheckBox.new(Filters.SearchInTables)
-local upvalueList = List.new(ResultsClip.Content)
+local deepSearch    = CheckBox.new(Filters.SearchInTables)
+local upvalueList   = List.new(ResultsClip.Content)
 
 local deepSearchFlag = false
-local fastSearchFlag = true
 local currentUpvalues = {}
-local updateConnection = nil
-local isVisible = false
-
-local scanInProgress = false
+local isVisible       = false
+local scanInProgress  = false
 
 local selectedLog
 local selectedUpvalue
 local selectedUpvalueLog
 local selectedElement
 
-local lastUpdateTime = 0
-local updateInterval = 1 / 20
-local visibleClosureLogs = {}
+local lastUpdateTime  = 0
+local updateInterval  = 1 / 20
 
 local spyClosureContext    = ContextMenuButton.new("rbxassetid://4666593447", "Spy Closure")
 local viewUpvaluesContext  = ContextMenuButton.new("rbxassetid://5179169654", "View All Upvalues")
@@ -87,35 +128,28 @@ local upvalueTypeDropdown = Dropdown.new(modifyUpvalueType)
 local elementTypeDropdown = Dropdown.new(modifyElementType)
 
 local constants = {
-    tempElementColor  = Color3.fromRGB(30, 10, 10),
-    tempUpvalueColor  = Color3.fromRGB(40, 20, 20),
-    tempBorderColor   = Color3.fromRGB(20, 0, 0),
+    tempElementColor = Color3.fromRGB(30, 10, 10),
+    tempUpvalueColor = Color3.fromRGB(40, 20, 20),
+    tempBorderColor  = Color3.fromRGB(20, 0, 0),
 }
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- FIX: Hard clear – destroys ALL cloned log instances and resets tracking table.
--- This is the primary fix for the "floating text on screen" bug: previously
--- logs were only hidden (Visible = false) but their instances stayed parented
--- to the ScrollingFrame and could escape clipping under certain conditions.
--- Now we fully destroy them so they cannot appear anywhere.
+-- FIX 2: clearAllLogs – destroys EVERY cloned instance completely.
+--         No instance is merely hidden; all are removed from the tree.
 -- ─────────────────────────────────────────────────────────────────────────────
 local function clearAllLogs()
-    -- Destroy every cloned instance still in the list
     for _, log in pairs(currentUpvalues) do
         if log and log.Instance then
             pcall(function() log.Instance:Destroy() end)
         end
     end
-    -- Wipe the tracking table so no stale references remain
-    currentUpvalues = {}
-    -- Reset the List control's canvas so height is correct
-    upvalueList:Clear()
-    -- Clear selections that pointed at now-destroyed objects
+    currentUpvalues    = {}
     selectedLog        = nil
     selectedUpvalue    = nil
     selectedUpvalueLog = nil
     selectedElement    = nil
-    visibleClosureLogs = {}
+    upvalueList:Clear()
+    ResultStatus.Visible = false
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -127,7 +161,7 @@ local function typeMismatchMessage()
 end
 
 local function addElement(upvalueLog, upvalue, index, value, temporary)
-    local elementLog      = Assets.Element:Clone()
+    local elementLog       = Assets.Element:Clone()
     local elementIndexType = typeof(index)
     local elementValueType = typeof(value)
     local indexText        = toString(index)
@@ -137,14 +171,17 @@ local function addElement(upvalueLog, upvalue, index, value, temporary)
         elementLog.Border.ImageColor3 = constants.tempBorderColor
     end
 
-    elementLog.Name                       = indexText
-    elementLog.Index.Label.Text           = indexText
+    elementLog.Name                   = indexText
+    elementLog.Index.Label.Text       = indexText
     local ok, vt = pcall(toString, value)
-    elementLog.Value.Label.Text           = ok and vt or "<error>"
-    elementLog.Index.Label.TextColor3     = oh.Constants.Syntax[elementIndexType]
-    elementLog.Index.Icon.Image           = oh.Constants.Types[elementIndexType]
-    elementLog.Value.Label.TextColor3     = oh.Constants.Syntax[elementValueType]
-    elementLog.Value.Icon.Image           = oh.Constants.Types[elementValueType]
+    elementLog.Value.Label.Text       = ok and vt or "<error>"
+    elementLog.Index.Label.TextColor3 = oh.Constants.Syntax[elementIndexType]
+    elementLog.Index.Icon.Image       = oh.Constants.Types[elementIndexType]
+    elementLog.Value.Label.TextColor3 = oh.Constants.Syntax[elementValueType]
+    elementLog.Value.Icon.Image       = oh.Constants.Types[elementValueType]
+
+    -- FIX: parent to safeContainer FIRST so it is never world-visible
+    elementLog.Parent = safeContainer
 
     local function showElementContext()
         selectedUpvalue    = upvalue
@@ -212,10 +249,13 @@ local function addUpvalue(upvalue, temporary)
         end
     end
 
-    upvalueLog.Name             = index
+    upvalueLog.Name             = tostring(index)
     upvalueLog.Index.Text       = index
     upvalueLog.Value.TextColor3 = oh.Constants.Syntax[valueType]
     upvalueLog.Icon.Image       = oh.Constants.Types[valueType]
+
+    -- FIX: always park in safeContainer immediately after cloning
+    upvalueLog.Parent = safeContainer
 
     local function showUpvalueContext()
         selectedUpvalue    = upvalue
@@ -281,11 +321,13 @@ end
 local Log = {}
 
 function Log.new(closure)
-    local log        = {}
-    -- FIX: Instance is created and parented via ListButton.new → list's
-    -- ScrollingFrame, which has ClipsDescendants = true. We never parent
-    -- instances anywhere else, so they cannot appear floating in the world.
-    local instance   = Assets.ClosureLog:Clone()
+    local log      = {}
+    local instance = Assets.ClosureLog:Clone()
+
+    -- FIX: Park in safeContainer first, THEN hand off to ListButton which
+    --      re-parents into the ScrollingFrame (which has ClipsDescendants).
+    instance.Parent = safeContainer
+
     local listButton = ListButton.new(instance, upvalueList)
     local logHeight  = 30
 
@@ -296,6 +338,7 @@ function Log.new(closure)
 
     for i, upvalue in pairs(closure.Upvalues) do
         local upvalueLog = addUpvalue(upvalue)
+        -- Now parent into the log's Upvalues frame (inside the ScrollingFrame)
         upvalueLog.Parent = instance.Upvalues
         logHeight         = logHeight + upvalueLog.AbsoluteSize.Y + 5
         log.Upvalues[i]   = upvalueLog
@@ -329,9 +372,8 @@ function Log.update(log)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- FIX: addUpvalues – ALWAYS destroy old logs before creating new ones.
--- The previous code only hid them; hidden instances can still escape clipping
--- when the parent ScrollingFrame is repositioned or the panel is toggled.
+-- FIX 3: addUpvalues – clear BEFORE spawning the task; release scan lock in
+--         a finally-equivalent block so the UI never gets permanently stuck.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local function addUpvalues()
@@ -340,21 +382,17 @@ local function addUpvalues()
     local query = SearchBox.Text
     SearchBox.Text = ""
 
-    if query:gsub("%s", "") == "" then
+    if query:gsub("%s", "") == "" or (not tonumber(query) and query:len() <= 1) then
         MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
         return
     end
 
-    if not tonumber(query) and query:len() <= 1 then
-        MessageBox.Show("Invalid query", "Your query is too short", MessageType.OK)
-        return
-    end
-
-    scanInProgress = true
+    scanInProgress       = true
+    ResultStatus.Visible = false
     oh.setStatus("Scanning upvalues…")
 
-    -- FIX: Destroy all existing log instances BEFORE the scan so there is
-    -- zero chance of stale UI elements being visible during or after the scan.
+    -- FIX: Destroy all old instances BEFORE the async scan starts.
+    --      This prevents old text from staying on screen during the scan.
     clearAllLogs()
 
     task.spawn(function()
@@ -370,10 +408,10 @@ local function addUpvalues()
             local batchSize  = 8
 
             for i = 1, #resultsArray do
-                local closure = resultsArray[i]
-                -- FIX: Never reuse stale log entries; always create fresh ones.
-                -- currentUpvalues was fully cleared above so this always creates new.
-                Log.new(closure)
+                -- If the panel was closed mid-scan, stop immediately
+                if not isVisible then break end
+
+                Log.new(resultsArray[i])
                 totalShown = totalShown + 1
 
                 if i % batchSize == 0 then
@@ -381,31 +419,31 @@ local function addUpvalues()
                 end
             end
 
-            ResultStatus.Visible    = (totalShown > 0)
-            ResultStatus.Label.Text = string.format(
-                "Found %d result%s", totalShown, totalShown ~= 1 and "s" or "")
-
             upvalueList:Recalculate()
 
-            if totalShown == 0 then
-                oh.setStatus("No upvalues found")
-            else
+            if totalShown > 0 then
+                ResultStatus.Visible    = true
+                ResultStatus.Label.Text = string.format(
+                    "Found %d result%s", totalShown, totalShown ~= 1 and "s" or "")
                 oh.setStatus(string.format("Upvalue Scanner – %d result%s",
                     totalShown, totalShown ~= 1 and "s" or ""))
+            else
+                oh.setStatus("No upvalues found")
             end
         end)
 
+        -- FIX: ALWAYS release the lock regardless of error
         scanInProgress = false
 
         if not ok then
-            oh.setStatus("Scan error")
+            oh.setStatus("Scan error – check console")
             warn("[UpvalueScanner] Scan error:", err)
         end
     end)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Context menus / bindings
+-- Context menu bindings
 -- ─────────────────────────────────────────────────────────────────────────────
 
 upvalueList:BindContextMenu(closureContextMenu)
@@ -513,9 +551,9 @@ local function generateScriptFormat(elementIndex)
 
 local aux = loadstring(game:HttpGetAsync("https://raw.githubusercontent.com/Upbolt/Hydroxide/revision/ohaux.lua"))()
 
-local scriptPath      = %s
-local closureName     = "%s"
-local upvalueIndex    = %d
+local scriptPath       = %s
+local closureName      = "%s"
+local upvalueIndex     = %d
 local closureConstants = %s
 
 local closure = aux.searchClosure(scriptPath, closureName, upvalueIndex, closureConstants)
@@ -576,13 +614,15 @@ elementScriptContext:SetCallback(function() generateScript(selectedElement) end)
 local SpyHook = ClosureSpy.Hook
 
 spyClosureContext:SetCallback(function()
-    local closure = selectedLog.Closure
+    local closure = selectedLog and selectedLog.Closure
+    if not closure then return end
     if TabSelector.SelectTab("ClosureSpy") then
         local result = SpyHook.new(closure)
         if result == false then
             MessageBox.Show("Already hooked", "You are already spying " .. closure.Name)
         elseif result == nil then
-            MessageBox.Show("Cannot hook", ('Cannot hook "%s" because there are no upvalues'):format(closure.Name))
+            MessageBox.Show("Cannot hook",
+                ('Cannot hook "%s" because there are no upvalues'):format(closure.Name))
         end
     end
 end)
@@ -599,7 +639,7 @@ viewUpvaluesContext:SetCallback(function()
             newHeight = newHeight - (upvalueLog.AbsoluteSize.Y + 5)
             upvalueLog:Destroy()
         end
-        selectedLog.TemporaryUpvalues = nil
+        selectedLog.TemporaryUpvalues       = nil
         selectedLog.Closure.TemporaryUpvalues = {}
     else
         local closure     = selectedLog.Closure
@@ -637,14 +677,18 @@ getScriptContext:SetCallback(function()
 end)
 
 viewElementsContext:SetCallback(function()
-    local temporaryElements = selectedUpvalue and selectedUpvalue.TemporaryElements
+    if not selectedUpvalue or not selectedUpvalueLog then return end
+
+    local temporaryElements = selectedUpvalue.TemporaryElements
     local newHeight = 0
 
     if temporaryElements then
         for index in pairs(temporaryElements) do
             local el = selectedUpvalueLog.Elements[toString(index)]
-            newHeight = newHeight - (el.AbsoluteSize.Y + 5)
-            el:Destroy()
+            if el then
+                newHeight = newHeight - (el.AbsoluteSize.Y + 5)
+                el:Destroy()
+            end
         end
         selectedUpvalue.TemporaryElements = nil
     else
@@ -664,7 +708,8 @@ viewElementsContext:SetCallback(function()
     end
 
     selectedUpvalueLog.Size = selectedUpvalueLog.Size + UDim2.new(0, 0, 0, newHeight)
-    selectedUpvalueLog.Parent.Parent.Size = selectedUpvalueLog.Parent.Parent.Size + UDim2.new(0, 0, 0, newHeight)
+    selectedUpvalueLog.Parent.Parent.Size =
+        selectedUpvalueLog.Parent.Parent.Size + UDim2.new(0, 0, 0, newHeight)
     upvalueList:Recalculate()
 end)
 
@@ -672,7 +717,8 @@ local function changeUpvalue()
     if selectedUpvalue then
         local index      = selectedUpvalue.Index
         local indexFrame = modifyUpvalueContent.Index
-        local indexWidth = TextService:GetTextSize(tostring(index), 18, "SourceSans", indexFrame.AbsoluteSize).X
+        local indexWidth = TextService:GetTextSize(
+            tostring(index), 18, "SourceSans", indexFrame.AbsoluteSize).X
 
         indexFrame.Number.Text = index
         indexFrame.Number.Size = UDim2.new(0, indexWidth, 0, 25)
@@ -689,7 +735,8 @@ changeElementContext:SetCallback(function()
         local indexType  = typeof(index)
         local indexFrame = modifyElementContent.Index
         local indexLabel = indexFrame.Data
-        local indexWidth = TextService:GetTextSize(index, 18, "SourceSans", indexFrame.AbsoluteSize).X
+        local indexWidth = TextService:GetTextSize(
+            tostring(index), 18, "SourceSans", indexFrame.AbsoluteSize).X
 
         indexLabel.Text       = index
         indexLabel.TextColor3 = oh.Constants.Syntax[indexType]
@@ -699,12 +746,8 @@ changeElementContext:SetCallback(function()
 end)
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- RenderStepped update loop
+-- FIX 4: RenderStepped – only runs when visible AND not scanning.
 -- ─────────────────────────────────────────────────────────────────────────────
-
-local lastScrollY        = 0
-local cacheResetInterval = 2.0
-local lastCacheReset     = 0
 
 oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function()
     if not isVisible or scanInProgress then return end
@@ -716,12 +759,6 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function()
     local viewTop    = ResultsClip.AbsolutePosition.Y
     local viewBottom = viewTop + ResultsClip.AbsoluteSize.Y
     local buffer     = 200
-
-    if now - lastCacheReset > cacheResetInterval then
-        lastCacheReset     = now
-        visibleClosureLogs = {}
-    end
-
     local updated    = 0
     local maxPerFrame = 3
 
@@ -742,43 +779,30 @@ oh.Events.UpdateUpvalues = RunService.RenderStepped:Connect(function()
 end)
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Page visibility handler
--- FIX: On hide, call clearAllLogs() to destroy all instances so nothing can
--- float over the game world when the panel is collapsed or tab is switched.
+-- FIX 5: onPageVisible – destroys ALL logs on hide so nothing floats.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local function onPageVisible(visible)
     isVisible = visible
 
     if not visible then
-        -- Release scan lock so next visit isn't permanently blocked
+        -- Release scan lock so next visit is never blocked
         scanInProgress = false
 
-        -- FIX: Fully destroy all log instances on hide.
-        -- This is the definitive fix for upvalue names/values appearing as
-        -- floating text over the game world when the Hydroxide panel is closed
-        -- or when the user switches tabs.
+        -- Destroy every log instance immediately
         clearAllLogs()
 
-        -- Dismiss any open prompts / menus
-        modifyUpvalue:Hide()
-        modifyElement:Hide()
-        closureContextMenu:Hide()
-        tableContextMenu:Hide()
-        upvalueContextMenu:Hide()
-        elementContextMenu:Hide()
+        -- Dismiss all overlays
+        pcall(function() modifyUpvalue:Hide() end)
+        pcall(function() modifyElement:Hide() end)
+        pcall(function() closureContextMenu:Hide() end)
+        pcall(function() tableContextMenu:Hide() end)
+        pcall(function() upvalueContextMenu:Hide() end)
+        pcall(function() elementContextMenu:Hide() end)
 
         pcall(function() SearchBox:ReleaseFocus() end)
         SearchBox.Text = ""
-
-        visibleClosureLogs = {}
-        lastScrollY        = 0
-        lastCacheReset     = 0
-
-        -- Hide status row
-        ResultStatus.Visible = false
     else
-        -- Force recalculate on revisit (currentUpvalues is empty after clearAllLogs)
         task.defer(function()
             upvalueList:Recalculate()
         end)
@@ -786,7 +810,7 @@ local function onPageVisible(visible)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Tab selector integration
+-- FIX 6: Tab selector override – destroy old logs before switching tabs.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local originalSelectTab = TabSelector.SelectTab
