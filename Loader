@@ -1,0 +1,12 @@
+local owner = "Yuki1224-Ch"
+local branch = "fix-lagging-issues-c265c"
+
+local function webImport(file)
+    return loadstring(game:HttpGetAsync(
+        ("https://raw.githubusercontent.com/%s/MC-Hydroxide/%s/%s.lua")
+        :format(owner, branch, file)
+    ), file .. '.lua')()
+end
+
+webImport("init")
+webImport("ui/main")
