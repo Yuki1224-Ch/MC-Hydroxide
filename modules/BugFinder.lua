@@ -231,7 +231,7 @@ local function scan(query, options)
     local queryLower = query and query:lower() or ""
     local useFuzzy = options.fuzzy or false
     local deepScan = options.deep or false
-    local maxResults = options.maxResults or 1000
+    local maxResults = options.maxResults or 500 -- Reduced default for better performance
     local categories = options.categories or {"security", "performance", "logic", "error_handling", "anti_tamper"}
     
     local resultCount = 0
@@ -296,10 +296,13 @@ local function scan(query, options)
         return workerResults
     end
     
-    -- Collect all closures from GC
+    -- Collect all closures from GC with limit
     local allClosures = {}
+    local closureLimit = 2000 -- Limit total closures to scan
     pcall(function()
         for _, v in pairs(getgc()) do
+            if #allClosures >= closureLimit then break end
+            
             if type(v) == "function" and not isxclosure(v) then
                 local success, script = pcall(function()
                     return rawget(getfenv(v), "script")
@@ -315,14 +318,21 @@ local function scan(query, options)
                     end
                 end
             end
+            
+            -- Yield periodically during collection
+            if #allClosures % 100 == 0 then
+                task.wait(0.001)
+            end
         end
     end)
     
     -- Process closures in batches to prevent freezing
-    local batchSize = 50
+    local batchSize = 30 -- Smaller batch size for better responsiveness
     local totalBatches = math.ceil(#allClosures / batchSize)
     
     for batchNum = 1, totalBatches do
+        if resultCount >= maxResults then break end
+        
         local startIndex = (batchNum - 1) * batchSize + 1
         local endIndex = math.min(batchNum * batchSize, #allClosures)
         
@@ -336,9 +346,9 @@ local function scan(query, options)
             table.insert(results, result)
         end
         
-        -- Yield periodically to prevent freezing
-        if batchNum % 5 == 0 then
-            task.wait(0.01)
+        -- Yield more frequently to prevent freezing
+        if batchNum % 3 == 0 then
+            task.wait(0.015)
         end
     end
     
